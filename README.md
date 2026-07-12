@@ -51,15 +51,40 @@ Start the camera's remote application, join its `DIRECT-...` Wi-Fi network, and
 select **Find camera**. The persistent gallery remains available without a camera
 connection, so saved work can be reviewed and edited offline.
 
-### Live camera control
+### Photo
 
-<img src="docs/screenshots/camera-control.png" alt="Connected camera screen with live view, shooting modes, exposure settings, shutter, zoom, gallery, and LUT controls" width="320">
+<img src="docs/screenshots/mode-photo.png" alt="Photo mode with live view, exposure settings, shutter, zoom, gallery, and LUT controls" width="320">
 
-The connected Photo screen combines the camera's live view with Photo, Live ND,
-Live Composite, and Panorama modes. Capability-driven controls expose ISO,
-exposure compensation, drive mode, the active exposure priority, remote zoom,
-the app shutter, recent captures, and live LUT selection without leaving the
-shooting screen.
+Photo mode provides normal single or continuous still capture. Capability-driven
+controls expose ISO, exposure compensation, drive mode, the active exposure
+priority, remote zoom, the app shutter, recent captures, and live LUT selection.
+Photos taken with the camera's physical shutter are detected and downloaded too.
+
+### Live ND
+
+<img src="docs/screenshots/mode-live-nd.png" alt="Live ND mode with frame count and high-speed burst controls" width="320">
+
+Live ND aligns and averages 2, 4, 8, 16, or 32 frames to simulate a longer
+exposure and reduce subject motion. It selects the highest available burst speed,
+holds the first burst for the combined exposure time plus one frame of margin,
+and captures correction frames when needed.
+
+### Live Composite
+
+<img src="docs/screenshots/mode-live-composite.png" alt="Live Composite mode with camera controls and composite start button" width="320">
+
+Live Composite builds an image progressively by retaining areas that become
+brighter than the base exposure. It is intended for light trails, fireworks,
+and other scenes where new highlights should accumulate without repeatedly
+brightening the background.
+
+### Panorama
+
+<img src="docs/screenshots/mode-panorama.png" alt="Panorama mode with camera controls and panorama start button" width="320">
+
+Panorama captures an overlapping sequence, registers the source frames, and
+rebuilds the complete stitch whenever a new frame arrives. Final rendering uses
+feathered blending to reduce seams and overlap artifacts.
 
 ### Capture and file settings
 
@@ -75,17 +100,7 @@ saved-image EXIF.
 
 The MediaStore-backed gallery shows captures from previous sessions in a
 three-column grid and respects camera orientation. Live ND, Live Composite, and
-Panorama show only their final result in the main grid. Opening a computational
-result provides a **Source frames** action for inspecting the contributing
-captures.
-
-### Live ND result and source access
-
-<img src="docs/screenshots/photo-detail.png" alt="Detailed Live ND result with edit and Source frames actions" width="320">
-
-The detail viewer presents the saved image at its natural aspect ratio. The
-palette action opens editing, while **Source frames** reveals the aligned frames
-used to create a Live ND, Composite, or Panorama result.
+Panorama keep the main grid focused on their final rendered results.
 
 ### Full-screen photo editing
 
