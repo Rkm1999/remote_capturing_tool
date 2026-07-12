@@ -23,6 +23,10 @@ API and exposes only capabilities reported by the connected camera.
 - Persistent MediaStore-backed three-column gallery with EXIF-aware detail viewing during transfers
 - Live-view 3D LUT preview and separate full-resolution derivatives with EXIF preservation
 - Import, preview, strength adjustment, and application of 3D `.cube` LUT files
+- Direct Lumix Lab ZIP sharing with persistent multi-LUT import
+- Full-screen photo editor with LUT attribution, strength, exposure, contrast,
+  saturation, and saved derivative copies
+- JPEG or WebP output selection
 - Optional phone-location geotagging in the EXIF of every saved JPEG
 - Progressive Live ND averaging with Burst and Single capture strategies
 - Progressive Live Composite brighter-than-base accumulation
@@ -36,6 +40,43 @@ The app never requests general photo-library access. Captured JPEGs are written
 to `Pictures/Sony Remote` using MediaStore. Diagnostic logs contain event names,
 errors, model/app versions, and byte/API counts; they do not contain images,
 Wi-Fi passwords, or analytics identifiers.
+
+## Feature Tour
+
+### Camera connection and offline gallery
+
+<img src="docs/screenshots/startup.png" alt="Remote Capture connection screen with Gallery, Wi-Fi settings, and Find camera controls" width="320">
+
+Start the camera's remote application, join its `DIRECT-...` Wi-Fi network, and
+select **Find camera**. The persistent gallery remains available without a camera
+connection, so saved work can be reviewed and edited offline.
+
+### Persistent gallery and computational results
+
+<img src="docs/screenshots/gallery.png" alt="Three-column Remote Capture gallery containing photos and a Live ND result" width="320">
+
+The MediaStore-backed gallery shows captures from previous sessions in a
+three-column grid and respects camera orientation. Live ND, Live Composite, and
+Panorama show only their final result in the main grid. Opening a computational
+result provides a **Source frames** action for inspecting the contributing
+captures.
+
+### Live ND result and source access
+
+<img src="docs/screenshots/photo-detail.png" alt="Detailed Live ND result with edit and Source frames actions" width="320">
+
+The detail viewer presents the saved image at its natural aspect ratio. The
+palette action opens editing, while **Source frames** reveals the aligned frames
+used to create a Live ND, Composite, or Panorama result.
+
+### Full-screen photo editing
+
+<img src="docs/screenshots/photo-editor.png" alt="Full-screen editor with LUT strength, basic adjustments, and LUT filmstrip" width="320">
+
+Editing provides LUT strength plus exposure, contrast, and saturation controls.
+Built-in and imported `.cube` LUTs appear in the bottom filmstrip. Photos saved
+with a LUT retain its name and strength in EXIF so the editor can restore the
+recorded selection later; edits are saved as a new copy.
 
 ## Compatibility
 
