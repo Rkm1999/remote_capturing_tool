@@ -51,6 +51,24 @@ Start the camera's remote application, join its `DIRECT-...` Wi-Fi network, and
 select **Find camera**. The persistent gallery remains available without a camera
 connection, so saved work can be reviewed and edited offline.
 
+### Live camera control
+
+<img src="docs/screenshots/camera-control.png" alt="Connected camera screen with live view, shooting modes, exposure settings, shutter, zoom, gallery, and LUT controls" width="320">
+
+The connected Photo screen combines the camera's live view with Photo, Live ND,
+Live Composite, and Panorama modes. Capability-driven controls expose ISO,
+exposure compensation, drive mode, the active exposure priority, remote zoom,
+the app shutter, recent captures, and live LUT selection without leaving the
+shooting screen.
+
+### Capture and file settings
+
+<img src="docs/screenshots/settings.png" alt="Settings for photo download quality, JPEG or WebP output, live-view quality, and geotagging" width="320">
+
+Settings choose Original or reduced 2M downloads, JPEG or WebP output, Standard
+or High live-view quality when supported, and optional phone GPS coordinates in
+saved-image EXIF.
+
 ### Persistent gallery and computational results
 
 <img src="docs/screenshots/gallery.png" alt="Three-column Remote Capture gallery containing photos and a Live ND result" width="320">
