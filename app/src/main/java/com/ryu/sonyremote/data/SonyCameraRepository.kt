@@ -15,6 +15,7 @@ import com.ryu.sonyremote.model.CapturedImage
 import com.ryu.sonyremote.model.ConnectionState
 import com.ryu.sonyremote.model.LiveViewFrame
 import com.ryu.sonyremote.model.PostviewSizePreference
+import com.ryu.sonyremote.model.OutputImageFormat
 import com.ryu.sonyremote.model.RemoteCapture
 import com.ryu.sonyremote.model.SonyCameraDevice
 import com.ryu.sonyremote.network.CameraHttpStream
@@ -68,6 +69,10 @@ class SonyCameraRepository(context: Context) {
     private val discovery = SsdpCameraDiscovery(appContext)
     private val descriptionParser = DeviceDescriptionParser()
     private val mediaStore = JpegMediaStore(appContext.contentResolver)
+
+    suspend fun loadSavedGallery(): List<SavedMediaItem> = mediaStore.listSaved()
+    suspend fun setLutAttribution(uri: Uri, name: String, strength: Float) =
+        mediaStore.setLutAttribution(uri, name, strength)
     private val phoneLocation = PhoneLocationProvider(appContext)
     @Volatile private var geotaggingEnabled = false
     private val commandMutex = Mutex()
@@ -122,9 +127,13 @@ class SonyCameraRepository(context: Context) {
     )
     val continuousCaptureBatches: SharedFlow<ContinuousBatchResult> =
         _continuousCaptureBatches.asSharedFlow()
+    private val _downloadProgress = MutableSharedFlow<CaptureDownloadProgress>(extraBufferCapacity = 32)
+    val downloadProgress: SharedFlow<CaptureDownloadProgress> = _downloadProgress.asSharedFlow()
 
     private val sessions = CurrentSessionGate<CameraSession>()
     private val computationalCaptureImport = AtomicBoolean(false)
+    @Volatile private var downloadedImageProcessor: suspend (ByteArray) -> ByteArray = { it }
+    @Volatile private var outputImageFormat = OutputImageFormat.Jpeg
     @Volatile private var pendingTransport: NetworkHttpTransport? = null
     @Volatile private var activeLiveViewStream: CameraHttpStream? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -373,7 +382,11 @@ class SonyCameraRepository(context: Context) {
     suspend fun downloadCapturedPostview(capture: CapturedImage): DownloadedCapture {
         val active = requireSession()
         PrivateNetworkPolicy.requireCameraUri(capture.remoteUri, active.device.descriptionUri.host)
-        val jpeg = JpegValidator.normalize(active.transport.readBytes(capture.remoteUri))
+        val jpeg = JpegValidator.normalize(
+            active.transport.readBytes(capture.remoteUri) { bytes, total ->
+                _downloadProgress.tryEmit(CaptureDownloadProgress(capture.remoteUri, bytes, total))
+            },
+        )
         DiagnosticLog.record(
             "photo_downloaded",
             mapOf(
@@ -398,19 +411,22 @@ class SonyCameraRepository(context: Context) {
     }
 
     suspend fun saveCapture(capture: DownloadedCapture, prefix: String): SavedCapture {
-        val savedUri = mediaStore.save(capture.jpeg, prefix)
+        val sourceJpeg = capture.jpeg
+        val jpeg = JpegValidator.normalize(downloadedImageProcessor(sourceJpeg))
+        val savedUri = mediaStore.save(jpeg, prefix, outputImageFormat)
+        if (jpeg !== sourceJpeg) runCatching { mediaStore.copyExif(sourceJpeg, savedUri) }
         applyPhoneLocation(savedUri)
         DiagnosticLog.record(
             "photo_saved",
             mapOf(
-                "bytes" to capture.jpeg.size.toString(),
+                "bytes" to jpeg.size.toString(),
                 "prefix" to prefix,
                 "source_count" to "1",
             ),
         )
         return SavedCapture(
             uri = savedUri,
-            jpeg = capture.jpeg,
+            jpeg = jpeg,
             originalSizeRequested = capture.originalSizeRequested,
             postviewRemoteUri = capture.postviewRemoteUri,
             postviewRemoteIsOriginal = capture.originalSizeRequested,
@@ -425,7 +441,7 @@ class SonyCameraRepository(context: Context) {
         metadataSourceJpeg: ByteArray? = null,
     ): SavedCapture {
         val normalized = JpegValidator.normalize(jpeg)
-        val savedUri = mediaStore.save(normalized, prefix)
+        val savedUri = mediaStore.save(normalized, prefix, outputImageFormat)
         if (metadataSourceJpeg != null) {
             runCatching { mediaStore.copyExif(metadataSourceJpeg, savedUri) }
                 .onFailure { error ->
@@ -455,6 +471,19 @@ class SonyCameraRepository(context: Context) {
         geotaggingEnabled = enabled
     }
 
+    fun setDownloadedImageProcessor(processor: suspend (ByteArray) -> ByteArray) {
+        downloadedImageProcessor = processor
+    }
+
+    fun setOutputImageFormat(format: OutputImageFormat) {
+        outputImageFormat = format
+    }
+
+    suspend fun setAutomaticPostviewPreference(preference: PostviewSizePreference) = commandMutex.withLock {
+        val active = requireSession()
+        active.backend.setPostviewSize(active.capabilities.availableApis, preference)
+    }
+
     private suspend fun applyPhoneLocation(uri: android.net.Uri) {
         if (!geotaggingEnabled) return
         val location = phoneLocation.currentLocation()
@@ -472,7 +501,7 @@ class SonyCameraRepository(context: Context) {
         val jpeg = JpegValidator.normalize(active.originalImportTransport.readBytes(remoteUri))
         currentCoroutineContext().ensureActive()
         check(sessions.isCurrent(active)) { "Camera connection ended during Original import" }
-        val savedUri = mediaStore.save(jpeg, "SONY_ORIGINAL")
+        val savedUri = mediaStore.save(jpeg, "SONY_ORIGINAL", outputImageFormat)
         DiagnosticLog.record(
             "original_import_saved",
             mapOf("bytes" to jpeg.size.toString()),
@@ -519,7 +548,7 @@ class SonyCameraRepository(context: Context) {
             PrivateNetworkPolicy.requireCameraUri(matched.originalUrl, active.device.descriptionUri.host)
             val jpeg = JpegValidator.normalize(active.originalImportTransport.readBytes(matched.originalUrl))
             currentCoroutineContext().ensureActive()
-            val savedUri = mediaStore.save(jpeg, "SONY_ORIGINAL")
+            val savedUri = mediaStore.save(jpeg, "SONY_ORIGINAL", outputImageFormat)
             DiagnosticLog.record(
                 "contents_transfer_original_saved",
                 mapOf("file_name" to (matched.fileName ?: "unknown"), "bytes" to jpeg.size.toString()),
@@ -1156,17 +1185,10 @@ class SonyCameraRepository(context: Context) {
                             return@forEach
                         }
                         if (!queuedUris.add(uri.captureKey())) return@forEach
-                        if (shouldRetainSingleOriginalReference(capture, computationalCaptureImport.get())) {
-                            queuedUris.remove(uri.captureKey())
-                            active.recentCaptureUris.add(uri)
+                        if (!computationalCaptureImport.get()) {
                             _physicalShutterReferences.emit(
-                                PendingRemoteCapture(
-                                    remoteCapture = capture,
-                                    liveViewJpeg = _latestFrame.value?.jpeg?.copyOf(),
-                                ),
+                                PendingRemoteCapture(capture, _latestFrame.value?.jpeg?.copyOf()),
                             )
-                            DiagnosticLog.record("physical_shutter_original_reference_retained")
-                            return@forEach
                         }
                         pendingCount.incrementAndGet()
                         _isPhysicalShutterTransferActive.value = true
@@ -1299,8 +1321,16 @@ class SonyCameraRepository(context: Context) {
         var lastError: Throwable? = null
         repeat(PHYSICAL_CAPTURE_SAVE_ATTEMPTS) { attempt ->
             try {
+                _downloadProgress.tryEmit(
+                    CaptureDownloadProgress(remoteUri, 0, null, attempt = attempt + 1),
+                )
                 PrivateNetworkPolicy.requireCameraUri(downloadUri, active.device.descriptionUri.host)
-                val jpeg = JpegValidator.normalize(active.eventTransport.readBytes(downloadUri))
+                val sourceJpeg = JpegValidator.normalize(
+                    active.eventTransport.readBytes(downloadUri) { bytes, total ->
+                        _downloadProgress.tryEmit(CaptureDownloadProgress(remoteUri, bytes, total))
+                    },
+                )
+                val jpeg = JpegValidator.normalize(downloadedImageProcessor(sourceJpeg))
                 currentCoroutineContext().ensureActive()
                 if (!sessions.isCurrent(active)) return null
                 DiagnosticLog.record(
@@ -1308,7 +1338,18 @@ class SonyCameraRepository(context: Context) {
                     mapOf("bytes" to jpeg.size.toString()),
                 )
                 val saved = SavedCapture(
-                    uri = mediaStore.save(jpeg, if (previewFirst) "SONY_PREVIEW" else "SONY"),
+                    uri = mediaStore.save(
+                        jpeg,
+                        when {
+                            computationalCaptureImport.get() -> "SONY_SOURCE"
+                            previewFirst -> "SONY_PREVIEW"
+                            else -> "SONY"
+                        },
+                        outputImageFormat,
+                    ).also { uri ->
+                        if (jpeg !== sourceJpeg) runCatching { mediaStore.copyExif(sourceJpeg, uri) }
+                        applyPhoneLocation(uri)
+                    },
                     jpeg = jpeg,
                     originalSizeRequested = !previewFirst && remoteUri.requestsOriginalPostview(),
                     thumbnailRemoteUri = remoteCapture.thumbnailUri,
@@ -1337,11 +1378,14 @@ class SonyCameraRepository(context: Context) {
                 if (error is CancellationException) throw error
                 lastError = error
                 if (attempt + 1 < PHYSICAL_CAPTURE_SAVE_ATTEMPTS) {
-                    delay(PHYSICAL_CAPTURE_RETRY_MILLIS)
+                    delay(PHYSICAL_CAPTURE_RETRY_MILLIS * (attempt + 1))
                 }
             }
         }
         val message = lastError.toUserMessage("Could not transfer the camera shutter photo")
+        _downloadProgress.tryEmit(
+            CaptureDownloadProgress(remoteUri, 0, null, attempt = PHYSICAL_CAPTURE_SAVE_ATTEMPTS, failed = true),
+        )
         _physicalShutterFailures.tryEmit(message)
         DiagnosticLog.record(
             "physical_shutter_capture_failed",
@@ -1413,7 +1457,7 @@ class SonyCameraRepository(context: Context) {
         const val PHYSICAL_CAPTURE_EVENT_BUFFER = 8
         const val PHYSICAL_CAPTURE_DEDUPE_SIZE = 128
         const val PHYSICAL_CAPTURE_URI_QUEUE_SIZE = 32
-        const val PHYSICAL_CAPTURE_SAVE_ATTEMPTS = 3
+        const val PHYSICAL_CAPTURE_SAVE_ATTEMPTS = 5
         const val PHYSICAL_CAPTURE_RETRY_MILLIS = 500L
         const val API_CAPTURE_DEDUPE_WAIT_MILLIS = 25L
         const val EVENT_FAILURE_LOG_INTERVAL = 5
@@ -1482,11 +1526,7 @@ internal data class RemoteCaptureDownload(
 internal fun selectRemoteCaptureDownload(
     capture: RemoteCapture,
     computational: Boolean,
-): RemoteCaptureDownload = if (!computational && capture.thumbnailUri != null) {
-    RemoteCaptureDownload(capture.thumbnailUri, previewFirst = true)
-} else {
-    RemoteCaptureDownload(capture.postviewUri, previewFirst = false)
-}
+): RemoteCaptureDownload = RemoteCaptureDownload(capture.postviewUri, previewFirst = false)
 
 internal fun shouldRetainSingleOriginalReference(
     capture: RemoteCapture,
@@ -1525,6 +1565,14 @@ data class ContinuousBatchResult(
 data class PendingRemoteCapture(
     val remoteCapture: RemoteCapture,
     val liveViewJpeg: ByteArray?,
+)
+
+data class CaptureDownloadProgress(
+    val remoteUri: URI,
+    val bytesRead: Long,
+    val totalBytes: Long?,
+    val attempt: Int = 1,
+    val failed: Boolean = false,
 )
 
 private data class RemoteCaptureBatch(

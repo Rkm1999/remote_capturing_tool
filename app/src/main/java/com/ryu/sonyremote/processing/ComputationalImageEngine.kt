@@ -227,6 +227,10 @@ class PanoramaSession internal constructor(private val maxFrames: Int) : AutoClo
             images += frame
             transforms += requireNotNull(transform)
             ownershipTransferred = true
+            val rebuiltTransforms = rebuildTransforms(images)
+            transforms.forEach(Mat::release)
+            transforms.clear()
+            transforms += rebuiltTransforms
             var blended: Mat? = null
             try {
                 blended = PanoramaBlender.render(images, transforms)
@@ -253,6 +257,32 @@ class PanoramaSession internal constructor(private val maxFrames: Int) : AutoClo
     fun encodeJpeg(): ByteArray {
         check(images.size >= 2) { "Take at least two panorama frames" }
         return CvCodec.encode(requireNotNull(panorama) { "Panorama is not ready" })
+    }
+
+    private fun rebuildTransforms(frames: List<Mat>): List<Mat> {
+        val rebuilt = mutableListOf<Mat>()
+        try {
+            rebuilt += Mat.eye(3, 3, CvType.CV_64F)
+            for (index in 1 until frames.size) {
+                val currentToPrevious = PanoramaMatcher.findHomography(frames[index], frames[index - 1])
+                try {
+                    val combined = Mat()
+                    val empty = Mat()
+                    try {
+                        Core.gemm(rebuilt.last(), currentToPrevious, 1.0, empty, 0.0, combined)
+                    } finally {
+                        empty.release()
+                    }
+                    rebuilt += combined
+                } finally {
+                    currentToPrevious.release()
+                }
+            }
+            return rebuilt
+        } catch (error: Throwable) {
+            rebuilt.forEach(Mat::release)
+            throw error
+        }
     }
 
     fun geometry(): List<PanoramaFrameGeometry> = images.indices.map { index ->

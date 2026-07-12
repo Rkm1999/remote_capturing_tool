@@ -17,9 +17,10 @@ API and exposes only capabilities reported by the connected camera.
 - Negotiated `getEvent` v1.2 continuous events with v1.0 compatibility fallback
 - Physical burst import and capability-gated press-and-hold app bursts
 - An `IMPORTING` status while one or more body-shutter JPEGs are pending
-- Preview-first imports with an independent, cancellable Original queue and
-  capability-gated Contents Transfer recovery
+- Immediate sequential postview downloads with Original or reduced 2M quality
+  selection and determinate byte progress when the camera reports content length
 - Latest-capture control plus an accessible capture-history viewer
+- Persistent MediaStore-backed three-column gallery with EXIF-aware detail viewing during transfers
 - Live-view 3D LUT preview and separate full-resolution derivatives with EXIF preservation
 - Import, preview, strength adjustment, and application of 3D `.cube` LUT files
 - Optional phone-location geotagging in the EXIF of every saved JPEG
@@ -43,7 +44,7 @@ that exposes the legacy ScalarWebAPI camera service. Compatibility is
 capability-driven: unavailable camera APIs result in unavailable or read-only UI
 controls rather than assumed support.
 
-**Hardware tested for v0.1 beta:**
+**Hardware tested for v0.2 beta:**
 
 - Samsung Galaxy S25 (`SM-S931W`), Android 16
 - Sony Alpha A6300 (`ILCE-6300`)
@@ -82,13 +83,26 @@ and saved in order while event polling continues. The live-view corner shows
 remain disabled until the pending import completes. No phone-side shutter action
 is required for an ordinary photo.
 
-For a single shot with an Original postview URL, the filmstrip first shows a
-recent live-view image labeled `Live view`. This is explicitly a placeholder,
-not the captured JPEG, and cannot be opened in the LUT editor. The Original URL
-is retained and downloaded only when **Import original** is selected. If Sony
-offers only a 2M postview, that JPEG is saved immediately and labeled
-`Preview only`; Original import remains unavailable unless a usable Contents
-Transfer record can be identified.
+As soon as the camera reports a postview URL, the filmstrip creates a temporary
+item and the sequential import queue starts downloading it. Settings selects
+either the camera's Original postview or a faster reduced 2M postview. A circular
+percentage indicator uses transferred bytes and HTTP content length; it remains
+indeterminate only when the camera omits content length. The downloaded JPEG
+replaces the temporary live-view thumbnail automatically.
+Interrupted transfers restart from the beginning up to five times with increasing
+backoff. The filmstrip reports the retry number and does not leave a permanent
+in-progress state after the final attempt.
+
+When a non-Original live-view LUT is selected in Photo mode, that LUT and its
+configured strength are applied before the downloaded JPEG is saved. Camera EXIF
+is copied to the processed image, followed by optional phone geotagging. Live ND,
+Live Composite, and Panorama source frames remain ungraded so processing operates
+on the camera data.
+
+The main gallery shows final photos and computational results across app
+sessions. Live ND, Composite, and Panorama source frames are hidden from the
+main grid; open a computational result and select **Source frames** to inspect
+the inputs associated with that result.
 
 When Drive is `Continuous` and the camera advertises `startContShooting`, the
 Photo shutter becomes a press-and-hold control. Release stops the burst, and a
@@ -126,7 +140,9 @@ it does not assume those controls exist.
 The stitched preview remains in the main viewer while a live-view picture-in-
 picture stays visible at the lower right. Every accepted or rejected source is
 saved independently. Finish plans the natural full-resolution output and scales
-it only when the device's measured memory/storage budget requires that; Cancel
+it only when the device's measured memory/storage budget requires that; it has no
+fixed edge or pixel-resolution ceiling. Each new frame rebuilds the transform
+chain and rerenders all retained sources instead of modifying the prior stitch. Cancel
 keeps sources and saves no final derivative.
 
 Selecting Panorama alone does not arm it; body-shutter photos taken before
@@ -147,7 +163,7 @@ ANDROID_SERIAL=<device-serial> ./gradlew connectedDebugAndroidTest
 
 The debug APK is produced at `app/build/outputs/apk/debug/app-debug.apk`.
 
-The `v0.1-beta` GitHub prerelease provides a debug-key-signed APK for direct
+The `v0.2-beta` GitHub prerelease provides a debug-key-signed APK for direct
 testing. It is not a production-signed Play Store artifact. Android may require
 permission to install apps from the browser or file manager used to open it.
 

@@ -32,6 +32,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -47,6 +50,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -101,6 +105,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -142,6 +147,8 @@ fun CameraRemoteApp(
     val lutPreviews by viewModel.lutPreviews.collectAsStateWithLifecycle()
     val zoomTargetPercent by viewModel.zoomTargetPercent.collectAsStateWithLifecycle()
     val geotaggingEnabled by viewModel.geotaggingEnabled.collectAsStateWithLifecycle()
+    val automaticPostviewPreference by viewModel.automaticPostviewPreference.collectAsStateWithLifecycle()
+    val outputImageFormat by viewModel.outputImageFormat.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -280,6 +287,7 @@ fun CameraRemoteApp(
                 onOpenWifi = onOpenWifi,
                 onFindCamera = onFindCamera,
                 onOpenAppSettings = onOpenAppSettings,
+                onOpenGallery = { showHistory = true },
             )
 
             is ConnectionState.Failed -> SetupScreen(
@@ -290,6 +298,7 @@ fun CameraRemoteApp(
                 onOpenWifi = onOpenWifi,
                 onFindCamera = onFindCamera,
                 onOpenAppSettings = onOpenAppSettings,
+                onOpenGallery = { showHistory = true },
             )
 
             ConnectionState.WaitingForWifi -> ProgressScreen(
@@ -320,6 +329,10 @@ fun CameraRemoteApp(
             capabilities = ready.capabilities,
             enabled = !isBusy,
             geotaggingEnabled = geotaggingEnabled,
+            postviewPreference = automaticPostviewPreference,
+            onSetPostviewPreference = viewModel::setAutomaticPostviewPreference,
+            outputImageFormat = outputImageFormat,
+            onSetOutputImageFormat = viewModel::setOutputImageFormat,
             onSetGeotagging = { enabled ->
                 if (!enabled) {
                     viewModel.setGeotaggingEnabled(false)
@@ -356,7 +369,9 @@ fun CameraRemoteApp(
         LutEditorDialog(
             state = requireNotNull(lutEditor),
             onSelectPreset = viewModel::selectLut,
+            onSelectImported = viewModel::selectEditorImportedLut,
             onSetIntensity = viewModel::setLutIntensity,
+            onSetBasicEdits = viewModel::setBasicEdits,
             onSave = viewModel::saveLutCopy,
             onDismiss = viewModel::closeLutEditor,
         )
@@ -364,7 +379,7 @@ fun CameraRemoteApp(
     if (showHistory) {
         CaptureHistoryDialog(
             items = filmstrip,
-            enabled = !isBusy,
+            enabled = true,
             onOpenLut = viewModel::openLutEditor,
             onImportOriginal = viewModel::requestOriginalImport,
             onCancelOriginal = viewModel::cancelOriginalImport,
@@ -382,6 +397,7 @@ private fun SetupScreen(
     onOpenWifi: () -> Unit,
     onFindCamera: () -> Unit,
     onOpenAppSettings: () -> Unit,
+    onOpenGallery: () -> Unit,
 ) {
     Column(
         modifier = modifier
@@ -396,6 +412,15 @@ private fun SetupScreen(
                 "Start the camera's remote application, then join its DIRECT Wi-Fi network.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        OutlinedButton(
+            onClick = onOpenGallery,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+        ) {
+            Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+            Spacer(Modifier.width(10.dp))
+            Text("Gallery")
         }
 
         if (error != null) {
@@ -461,6 +486,10 @@ private fun CameraSettingsDialog(
     enabled: Boolean,
     geotaggingEnabled: Boolean,
     onSetGeotagging: (Boolean) -> Unit,
+    postviewPreference: com.ryu.sonyremote.model.PostviewSizePreference,
+    onSetPostviewPreference: (com.ryu.sonyremote.model.PostviewSizePreference) -> Unit,
+    outputImageFormat: com.ryu.sonyremote.model.OutputImageFormat,
+    onSetOutputImageFormat: (com.ryu.sonyremote.model.OutputImageFormat) -> Unit,
     onSetLiveviewSize: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -469,6 +498,43 @@ private fun CameraSettingsDialog(
         title = { Text("Settings") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Photo download", style = MaterialTheme.typography.titleSmall)
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    val choices = listOf(
+                        com.ryu.sonyremote.model.PostviewSizePreference.Original to "Original",
+                        com.ryu.sonyremote.model.PostviewSizePreference.FastPreview to "Reduced",
+                    )
+                    choices.forEachIndexed { index, (preference, label) ->
+                        SegmentedButton(
+                            selected = postviewPreference == preference,
+                            onClick = { onSetPostviewPreference(preference) },
+                            enabled = enabled,
+                            shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                            label = { Text(label) },
+                        )
+                    }
+                }
+                Text(
+                    "Original uses the camera's full postview when available. Reduced uses 2M for faster transfer.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Saved format", style = MaterialTheme.typography.titleSmall)
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    val formats = listOf(
+                        com.ryu.sonyremote.model.OutputImageFormat.Jpeg to "JPEG",
+                        com.ryu.sonyremote.model.OutputImageFormat.Webp to "WebP",
+                    )
+                    formats.forEachIndexed { index, (format, label) ->
+                        SegmentedButton(
+                            selected = outputImageFormat == format,
+                            onClick = { onSetOutputImageFormat(format) },
+                            enabled = enabled,
+                            shape = SegmentedButtonDefaults.itemShape(index, formats.size),
+                            label = { Text(label) },
+                        )
+                    }
+                }
                 Text("Live view quality", style = MaterialTheme.typography.titleSmall)
                 if (capabilities.availableLiveviewSizes.isEmpty()) {
                     Text(
@@ -601,8 +667,8 @@ private fun CameraControlScreen(
     onAddLiveLut: (LutPreset) -> Unit,
     onRemoveLiveLut: (LutPreset) -> Unit,
     onImportCubeLut: () -> Unit,
-    onSelectImportedLut: () -> Unit,
-    onRemoveImportedLut: () -> Unit,
+    onSelectImportedLut: (String) -> Unit,
+    onRemoveImportedLut: (String) -> Unit,
     onOpenHistory: () -> Unit,
     onRetryLiveView: () -> Unit,
     onSetSetting: (com.ryu.sonyremote.model.CameraSettingId, String) -> Unit,
@@ -619,12 +685,18 @@ private fun CameraControlScreen(
     val showProcessedPreview = routedPreviews.main === session.preview && session.preview != null
     val visiblePreview = routedPreviews.main
     val pipPreview = routedPreviews.pip
+    val liveNdExposure = liveNdExposureLabel(
+        capabilities.settings[com.ryu.sonyremote.model.CameraSettingId.ShutterSpeed]?.currentWireValue,
+        liveNdFrames,
+    )
     val liveStatus = when {
         showProcessedPreview && session.mode == CaptureMode.LiveNd -> {
-            "ND ${session.frameCount}/${session.targetFrames ?: liveNdFrames}"
+            "ND ${session.frameCount}/${session.targetFrames ?: liveNdFrames}" +
+                (liveNdExposure?.let { " • $it" } ?: "")
         }
         showProcessedPreview && session.mode == CaptureMode.LiveComposite -> "COMPOSITE ${session.frameCount}"
         isContinuousBurstActive -> "BURST"
+        captureMode == CaptureMode.LiveNd && liveNdExposure != null -> "ND $liveNdExposure"
         else -> "LIVE"
     }
     Column(
@@ -1463,8 +1535,8 @@ private fun PhotoBottomArea(
     onAdd: (LutPreset) -> Unit,
     onRemove: (LutPreset) -> Unit,
     onImport: () -> Unit,
-    onSelectImported: () -> Unit,
-    onRemoveImported: () -> Unit,
+    onSelectImported: (String) -> Unit,
+    onRemoveImported: (String) -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer),
@@ -1477,7 +1549,7 @@ private fun PhotoBottomArea(
                 .padding(start = 10.dp, top = 4.dp)
                 .width(78.dp)
                 .height(62.dp)
-                .clickable(enabled = enabled && latest != null, onClick = onOpenHistory),
+                .clickable(enabled = latest != null, onClick = onOpenHistory),
         ) {
             Box(contentAlignment = Alignment.Center) {
                 if (latest != null) {
@@ -1500,7 +1572,9 @@ private fun PhotoBottomArea(
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
                         )
                     }
-                    if (latest.importedCapture?.originalImportState in setOf(
+                    if (latest.source is CaptureAssetSource.LiveViewPlaceholder) {
+                        DownloadProgressOverlay(latest.importedCapture?.downloadFraction)
+                    } else if (latest.importedCapture?.originalImportState in setOf(
                             OriginalImportState.Queued,
                             OriginalImportState.Downloading,
                         )
@@ -1532,8 +1606,8 @@ private fun LutCaptureControls(
     onAdd: (LutPreset) -> Unit,
     onRemove: (LutPreset) -> Unit,
     onImport: () -> Unit,
-    onSelectImported: () -> Unit,
-    onRemoveImported: () -> Unit,
+    onSelectImported: (String) -> Unit,
+    onRemoveImported: (String) -> Unit,
 ) {
     var editorOpen by remember { mutableStateOf(false) }
     Row(
@@ -1592,17 +1666,16 @@ private fun LutCaptureControls(
                     }
                 }
             }
-            state.importedLut?.let { imported ->
-                item(key = "imported") {
+            items(state.importedLuts, key = { "imported:${it.label}" }) { imported ->
                     Surface(
                         shape = MaterialTheme.shapes.small,
                         modifier = Modifier.width(76.dp).height(62.dp)
                             .border(
-                                if (state.importedSelected) 2.dp else 0.dp,
+                                if (state.selectedImportedLabel == imported.label) 2.dp else 0.dp,
                                 MaterialTheme.colorScheme.primary,
                                 MaterialTheme.shapes.small,
                             )
-                            .clickable(enabled = enabled, onClick = onSelectImported),
+                            .clickable(enabled = enabled) { onSelectImported(imported.label) },
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             imported.thumbnail?.let {
@@ -1618,7 +1691,6 @@ private fun LutCaptureControls(
                             )
                         }
                     }
-                }
             }
         }
         IconButton(
@@ -1645,8 +1717,8 @@ private fun LutSettingsDialog(
     onAdd: (LutPreset) -> Unit,
     onRemove: (LutPreset) -> Unit,
     onImport: () -> Unit,
-    onSelectImported: () -> Unit,
-    onRemoveImported: () -> Unit,
+    onSelectImported: (String) -> Unit,
+    onRemoveImported: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var addMenuOpen by remember { mutableStateOf(false) }
@@ -1656,16 +1728,18 @@ private fun LutSettingsDialog(
         title = { Text("Edit LUTs") },
         text = {
             Column {
-                state.importedLut?.let { imported ->
+                state.importedLuts.forEach { imported ->
+                    val selected = state.selectedImportedLabel == imported.label
+                    val intensity = state.importedIntensities[imported.label] ?: 1f
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        FilterChip(state.importedSelected, onSelectImported, { Text(imported.label) })
+                        FilterChip(selected, { onSelectImported(imported.label) }, { Text(imported.label) })
                         Slider(
-                            value = state.importedIntensity,
-                            onValueChange = { if (!state.importedSelected) onSelectImported(); onIntensity(it) },
+                            value = intensity,
+                            onValueChange = { if (!selected) onSelectImported(imported.label); onIntensity(it) },
                             modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
                         )
-                        Text("${(state.importedIntensity * 100).toInt()}%")
-                        IconButton(onClick = onRemoveImported) {
+                        Text("${(intensity * 100).toInt()}%")
+                        IconButton(onClick = { onRemoveImported(imported.label) }) {
                             Icon(Icons.Default.Delete, contentDescription = "Remove ${imported.label}")
                         }
                     }
@@ -1710,18 +1784,6 @@ private fun LutSettingsDialog(
                             )
                         }
                     }
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Save LUT copy")
-                    Switch(
-                        checked = state.bakeIntoPhotos,
-                        onCheckedChange = onBake,
-                        enabled = !state.isOriginal,
-                    )
                 }
             }
         },
@@ -1775,6 +1837,9 @@ private fun Filmstrip(
                             contentScale = ContentScale.Crop,
                         )
                         val imported = item.importedCapture
+                        if (item.source is CaptureAssetSource.LiveViewPlaceholder) {
+                            DownloadProgressOverlay(imported?.downloadFraction)
+                        }
                         when (imported?.originalImportState) {
                             OriginalImportState.Available -> IconButton(
                                 onClick = { onImportOriginal(item.id) },
@@ -1845,6 +1910,27 @@ private fun Filmstrip(
 }
 
 @Composable
+private fun DownloadProgressOverlay(fraction: Float?) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.72f),
+        shape = CircleShape,
+    ) {
+        Box(Modifier.size(42.dp), contentAlignment = Alignment.Center) {
+            if (fraction == null) {
+                CircularProgressIndicator(Modifier.size(34.dp), strokeWidth = 3.dp)
+            } else {
+                CircularProgressIndicator(
+                    progress = { fraction },
+                    modifier = Modifier.size(34.dp),
+                    strokeWidth = 3.dp,
+                )
+                Text("${(fraction * 100).toInt()}%", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+@Composable
 private fun CaptureHistoryDialog(
     items: List<FilmstripItem>,
     enabled: Boolean,
@@ -1853,39 +1939,129 @@ private fun CaptureHistoryDialog(
     onCancelOriginal: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = MaterialTheme.shapes.small,
-            color = MaterialTheme.colorScheme.surface,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Column {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 8.dp, end = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Capture history", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Close capture history")
+    var selectedId by remember { mutableStateOf<String?>(null) }
+    var sourceIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val selected = items.firstOrNull { it.id == selectedId }
+    val visibleItems = if (sourceIds.isEmpty()) {
+        items.filterNot { it.kind == CaptureAssetKind.SourceFrame }
+    } else {
+        items.filter { it.id in sourceIds }
+    }
+    val context = LocalContext.current
+    var detailBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(selected?.id) {
+        detailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
+        detailBitmap = null
+        val uri = (selected?.source as? CaptureAssetSource.MediaStore)?.uri ?: return@LaunchedEffect
+        detailBitmap = withContext(Dispatchers.IO) {
+            context.contentResolver.loadThumbnail(uri, android.util.Size(2_048, 2_048), null)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { detailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle() }
+    }
+    Dialog(
+        onDismissRequest = { if (selected != null) selectedId = null else onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(color = Color.Black, modifier = Modifier.fillMaxSize()) {
+            if (selected != null) {
+                Box(Modifier.fillMaxSize()) {
+                    Image(
+                        bitmap = (detailBitmap ?: selected.thumbnail).asImageBitmap(),
+                        contentDescription = "${selected.title} detail",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().background(Color.Black.copy(alpha = 0.65f)),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            selected.importedCapture?.qualityLabel ?: selected.title,
+                            color = Color.White,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (selected.source !is CaptureAssetSource.LiveViewPlaceholder) {
+                            IconButton(onClick = { onDismiss(); onOpenLut(selected) }) {
+                                Icon(Icons.Default.Palette, "Edit photo", tint = Color.White)
+                            }
+                        }
+                        if (selected.relatedSourceIds.isNotEmpty()) {
+                            TextButton(onClick = {
+                                sourceIds = selected.relatedSourceIds.toSet()
+                                selectedId = null
+                            }) {
+                                Text("Source frames", color = Color.White)
+                            }
+                        }
+                        IconButton(onClick = { selectedId = null }) {
+                            Icon(Icons.Default.Close, "Back to gallery", tint = Color.White)
+                        }
+                    }
+                    if (selected.source is CaptureAssetSource.LiveViewPlaceholder) {
+                        Box(Modifier.align(Alignment.Center)) {
+                            DownloadProgressOverlay(selected.importedCapture?.downloadFraction)
+                        }
                     }
                 }
-                if (items.isEmpty()) {
-                    Text(
-                        "No captures",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(24.dp),
-                    )
-                } else {
-                    Filmstrip(
-                        items = items,
-                        enabled = enabled,
-                        onOpenLut = { item ->
-                            onDismiss()
-                            onOpenLut(item)
-                        },
-                        onImportOriginal = onImportOriginal,
-                        onCancelOriginal = onCancelOriginal,
-                    )
+            } else {
+                Column(Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (sourceIds.isEmpty()) "Gallery" else "Source frames",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (sourceIds.isNotEmpty()) {
+                            TextButton(onClick = { sourceIds = emptySet() }) { Text("All photos") }
+                        }
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, "Close gallery", tint = Color.White)
+                        }
+                    }
+                    if (items.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("No captures", color = Color.LightGray)
+                        }
+                    } else {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            gridItems(visibleItems.reversed(), key = { it.id }) { item ->
+                                Box(
+                                    Modifier.aspectRatio(1f).clickable { selectedId = item.id },
+                                ) {
+                                    Image(
+                                        item.thumbnail.asImageBitmap(),
+                                        item.title,
+                                        Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop,
+                                    )
+                                    if (item.source is CaptureAssetSource.LiveViewPlaceholder) {
+                                        Box(Modifier.align(Alignment.Center)) {
+                                            DownloadProgressOverlay(item.importedCapture?.downloadFraction)
+                                        }
+                                    }
+                                    Text(
+                                        item.importedCapture?.qualityLabel ?: item.title,
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 1,
+                                        modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                                            .background(Color.Black.copy(alpha = 0.6f)).padding(4.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1896,15 +2072,19 @@ private fun CaptureHistoryDialog(
 private fun LutEditorDialog(
     state: LutEditorUiState,
     onSelectPreset: (LutPreset) -> Unit,
+    onSelectImported: (String) -> Unit,
     onSetIntensity: (Float) -> Unit,
+    onSetBasicEdits: (Float, Float, Float) -> Unit,
     onSave: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
         Surface(
-            shape = MaterialTheme.shapes.small,
             color = MaterialTheme.colorScheme.surface,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxSize(),
         ) {
             Column {
                 Row(
@@ -1917,12 +2097,20 @@ private fun LutEditorDialog(
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
+                    state.item.appliedLutName?.let { name ->
+                        Text(
+                            "$name ${((state.item.appliedLutStrength ?: 1f) * 100).toInt()}%",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(end = 8.dp),
+                        )
+                    }
                     IconButton(onClick = onDismiss, enabled = !state.isProcessing) {
                         Icon(Icons.Default.Close, contentDescription = "Close LUT editor")
                     }
                 }
                 Box(
-                    modifier = Modifier.fillMaxWidth().height(320.dp).background(Color.Black),
+                    modifier = Modifier.fillMaxWidth().weight(1f).background(Color.Black),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (state.preview != null) {
@@ -1937,19 +2125,6 @@ private fun LutEditorDialog(
                         CircularProgressIndicator(color = Color.White)
                     }
                 }
-                LazyRow(
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(LutPreset.entries, key = { it.name }) { preset ->
-                        FilterChip(
-                            selected = state.preset == preset,
-                            onClick = { onSelectPreset(preset) },
-                            enabled = !state.isProcessing,
-                            label = { Text(preset.label) },
-                        )
-                    }
-                }
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -1958,11 +2133,22 @@ private fun LutEditorDialog(
                     Slider(
                         value = state.intensity,
                         onValueChange = onSetIntensity,
-                        enabled = !state.isProcessing && state.preset != LutPreset.Neutral,
+                        enabled = !state.isProcessing &&
+                            (state.selectedImportedLabel != null || state.preset != LutPreset.Neutral),
                         modifier = Modifier.weight(1f).padding(start = 12.dp),
                     )
                     Text("${(state.intensity * 100).toInt()}%", style = MaterialTheme.typography.labelSmall)
                 }
+                BasicEditSlider("Exposure", state.exposure) {
+                    onSetBasicEdits(it, state.contrast, state.saturation)
+                }
+                BasicEditSlider("Contrast", state.contrast) {
+                    onSetBasicEdits(state.exposure, it, state.saturation)
+                }
+                BasicEditSlider("Saturation", state.saturation) {
+                    onSetBasicEdits(state.exposure, state.contrast, it)
+                }
+                LutEditorFilmstrip(state, onSelectPreset, onSelectImported)
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.End,
@@ -1972,7 +2158,10 @@ private fun LutEditorDialog(
                     Spacer(Modifier.width(8.dp))
                     Button(
                         onClick = onSave,
-                        enabled = state.preset != LutPreset.Neutral && !state.isProcessing,
+                        enabled = (
+                            state.selectedImportedLabel != null || state.preset != LutPreset.Neutral || state.exposure != 0f ||
+                                state.contrast != 0f || state.saturation != 0f
+                            ) && !state.isProcessing,
                     ) {
                         Icon(Icons.Default.Palette, contentDescription = null)
                         Spacer(Modifier.width(7.dp))
@@ -1981,6 +2170,88 @@ private fun LutEditorDialog(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun LutEditorFilmstrip(
+    state: LutEditorUiState,
+    onSelectPreset: (LutPreset) -> Unit,
+    onSelectImported: (String) -> Unit,
+) {
+    LazyRow(
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        items(LutPreset.entries, key = { it.name }) { preset ->
+            Surface(
+                modifier = Modifier.width(82.dp).height(64.dp)
+                    .border(
+                        if (state.selectedImportedLabel == null && state.preset == preset) 2.dp else 0.dp,
+                        MaterialTheme.colorScheme.primary,
+                        MaterialTheme.shapes.small,
+                    )
+                    .clickable(enabled = !state.isProcessing) { onSelectPreset(preset) },
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Box {
+                    state.lutThumbnails[preset]?.let {
+                        Image(it.asImageBitmap(), preset.label, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    }
+                    Text(
+                        preset.label,
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.65f)).padding(3.dp),
+                    )
+                }
+            }
+        }
+        items(state.importedLuts, key = { "editor:${it.label}" }) { imported ->
+            Surface(
+                modifier = Modifier.width(82.dp).height(64.dp)
+                    .border(
+                        if (state.selectedImportedLabel == imported.label) 2.dp else 0.dp,
+                        MaterialTheme.colorScheme.primary,
+                        MaterialTheme.shapes.small,
+                    )
+                    .clickable(enabled = !state.isProcessing) { onSelectImported(imported.label) },
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Box {
+                    state.importedLutThumbnails[imported.label]?.let {
+                        Image(it.asImageBitmap(), imported.label, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    }
+                    Text(
+                        imported.label,
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.65f)).padding(3.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BasicEditSlider(label: String, value: Float, onValueChange: (Float) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(76.dp))
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = -1f..1f,
+            modifier = Modifier.weight(1f),
+        )
+        Text("${(value * 100).toInt()}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(36.dp))
     }
 }
 

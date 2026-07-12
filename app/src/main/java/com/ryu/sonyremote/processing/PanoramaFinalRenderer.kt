@@ -19,8 +19,8 @@ data class PanoramaSourceDimensions(val width: Int, val height: Int) {
 data class PanoramaResourceBudget(
     val maxHeapBytes: Long,
     val availableDiskBytes: Long,
-    val maxOutputEdge: Int = 30_000,
-    val maxOutputPixels: Long = 250_000_000L,
+    val maxOutputEdge: Int = Int.MAX_VALUE,
+    val maxOutputPixels: Long = Long.MAX_VALUE,
 ) {
     init {
         require(maxHeapBytes > 0 && availableDiskBytes > 0)
@@ -166,7 +166,7 @@ class PanoramaFinalRenderer(
                     h[8].toFloat(),
                 ))
             }
-            paint.alpha = if (index == 0) 255 else 224
+            paint.alpha = 255
             canvas.drawBitmap(bitmap, matrix, paint)
         } finally {
             bitmap.recycle()

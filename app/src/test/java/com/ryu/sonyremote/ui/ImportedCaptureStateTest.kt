@@ -9,14 +9,19 @@ import org.junit.Test
 
 class ImportedCaptureStateTest {
     @Test
-    fun liveViewPlaceholderIsNotReportedAsCapturedPreview() {
+    fun reportsDeterminateAutomaticDownloadProgress() {
+        val capture = ImportedCapture(downloadBytes = 250, downloadTotalBytes = 1_000)
+        assertEquals(0.25f, capture.downloadFraction)
+    }
+    @Test
+    fun automaticDownloadPlaceholderReportsTransferState() {
         val capture = ImportedCapture(
             postviewRemoteUrl = URI("http://192.168.122.1/original.jpg?size=Original"),
             postviewIsOriginal = true,
             isLiveViewPlaceholder = true,
         )
 
-        assertEquals("Live view", capture.qualityLabel)
+        assertEquals("Downloading", capture.qualityLabel)
         assertEquals(null, capture.previewUri)
         assertEquals(OriginalImportState.Available, capture.originalImportState)
     }

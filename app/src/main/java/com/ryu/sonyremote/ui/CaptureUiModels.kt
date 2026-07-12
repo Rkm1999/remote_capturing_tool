@@ -45,9 +45,9 @@ data class LutCaptureState(
     val presetIntensities: Map<LutPreset, Float> = LutPreset.entries.associateWith { 1f },
     val visiblePresets: List<LutPreset> = DEFAULT_VISIBLE_LUTS,
     val bakeIntoPhotos: Boolean = false,
-    val importedLut: ImportedLut? = null,
-    val importedSelected: Boolean = false,
-    val importedIntensity: Float = 1f,
+    val importedLuts: List<ImportedLut> = emptyList(),
+    val selectedImportedLabel: String? = null,
+    val importedIntensities: Map<String, Float> = emptyMap(),
 ) {
     init {
         require(presetIntensities.values.all { it in 0f..1f })
@@ -55,23 +55,37 @@ data class LutCaptureState(
         require(visiblePresets.distinct().size == visiblePresets.size)
     }
 
+    val importedLut: ImportedLut? get() = importedLuts.firstOrNull { it.label == selectedImportedLabel }
+    val importedSelected: Boolean get() = importedLut != null
+    val importedIntensity: Float get() = selectedImportedLabel?.let { importedIntensities[it] } ?: 1f
     val intensity: Float get() = if (importedSelected) importedIntensity else presetIntensities[preset] ?: 1f
     val isOriginal: Boolean get() = !importedSelected && (preset == LutPreset.Neutral || intensity == 0f)
 
-    fun select(preset: LutPreset): LutCaptureState = copy(preset = preset, importedSelected = false)
+    fun select(preset: LutPreset): LutCaptureState = copy(preset = preset, selectedImportedLabel = null)
 
-    fun selectImported(): LutCaptureState = if (importedLut == null) this else copy(importedSelected = true)
+    fun selectImported(label: String): LutCaptureState =
+        if (importedLuts.none { it.label == label }) this else copy(selectedImportedLabel = label)
 
-    fun import(lut: ImportedLut): LutCaptureState = copy(importedLut = lut, importedSelected = true)
+    fun import(lut: ImportedLut): LutCaptureState = copy(
+        importedLuts = importedLuts.filterNot { it.label == lut.label } + lut,
+        selectedImportedLabel = lut.label,
+        importedIntensities = importedIntensities + (lut.label to 1f),
+    )
 
-    fun removeImported(): LutCaptureState = copy(importedLut = null, importedSelected = false)
+    fun removeImported(label: String): LutCaptureState = copy(
+        importedLuts = importedLuts.filterNot { it.label == label },
+        selectedImportedLabel = selectedImportedLabel.takeUnless { it == label },
+        importedIntensities = importedIntensities - label,
+    )
 
     fun withIntensity(preset: LutPreset, intensity: Float): LutCaptureState = copy(
         presetIntensities = presetIntensities + (preset to intensity.coerceIn(0f, 1f)),
     )
 
     fun withImportedIntensity(intensity: Float): LutCaptureState =
-        copy(importedIntensity = intensity.coerceIn(0f, 1f))
+        selectedImportedLabel?.let {
+            copy(importedIntensities = importedIntensities + (it to intensity.coerceIn(0f, 1f)))
+        } ?: this
 
     fun addPreset(preset: LutPreset): LutCaptureState =
         if (preset in visiblePresets) this else copy(visiblePresets = visiblePresets + preset)
@@ -122,14 +136,21 @@ data class ImportedCapture(
     ),
     val width: Int? = null,
     val height: Int? = null,
+    val downloadBytes: Long = 0,
+    val downloadTotalBytes: Long? = null,
+    val downloadAttempt: Int = 1,
+    val downloadFailed: Boolean = false,
 ) {
+    val downloadFraction: Float?
+        get() = downloadTotalBytes?.takeIf { it > 0 }?.let { (downloadBytes.toFloat() / it).coerceIn(0f, 1f) }
     val displayUri: Uri? get() = originalUri ?: previewUri
     val qualityLabel: String
         get() = when {
             originalUri != null -> "Original"
             previewUri != null && originalImportState == OriginalImportState.NotAvailable -> "Preview only"
             previewUri != null -> "Preview"
-            isLiveViewPlaceholder -> "Live view"
+            downloadFailed -> "Download failed"
+            isLiveViewPlaceholder -> if (downloadAttempt > 1) "Retry $downloadAttempt" else "Downloading"
             else -> "Pending"
         }
 }
@@ -210,6 +231,9 @@ data class FilmstripItem(
     val thumbnail: Bitmap,
     val sourceCount: Int = 1,
     val importedCapture: ImportedCapture? = null,
+    val relatedSourceIds: List<String> = emptyList(),
+    val appliedLutName: String? = null,
+    val appliedLutStrength: Float? = null,
 )
 
 data class CaptureSessionUiState(
@@ -275,6 +299,30 @@ internal fun exposurePrioritySetting(
 internal fun zoomTargetReached(current: Int, target: Int, direction: String, tolerance: Int = 1): Boolean =
     if (direction == "in") current >= target - tolerance else current <= target + tolerance
 
+internal fun shutterDurationSeconds(value: String?): Double? {
+    val normalized = value?.trim()?.removeSuffix("s") ?: return null
+    val parts = normalized.split('/')
+    return when (parts.size) {
+        1 -> parts[0].toDoubleOrNull()
+        2 -> {
+            val numerator = parts[0].toDoubleOrNull() ?: return null
+            val denominator = parts[1].toDoubleOrNull()?.takeIf { it != 0.0 } ?: return null
+            numerator / denominator
+        }
+        else -> null
+    }
+}
+
+internal fun liveNdExposureLabel(shutter: String?, frames: Int): String? =
+    shutterDurationSeconds(shutter)?.let { seconds ->
+        val total = seconds * (frames + 1)
+        when {
+            total < 1.0 -> "${(total * 1_000).toInt()}ms"
+            total < 10.0 -> String.format(java.util.Locale.US, "%.1fs", total)
+            else -> "${total.toInt()}s"
+        }
+    }
+
 internal fun prioritizedPhotoSettings(
     settings: Collection<CameraSetting>,
 ): Pair<List<CameraSetting>, List<CameraSetting>> {
@@ -308,6 +356,13 @@ data class LutEditorUiState(
     val item: FilmstripItem,
     val preset: LutPreset = LutPreset.Neutral,
     val intensity: Float = 1f,
+    val exposure: Float = 0f,
+    val contrast: Float = 0f,
+    val saturation: Float = 0f,
+    val lutThumbnails: Map<LutPreset, Bitmap> = emptyMap(),
+    val importedLuts: List<ImportedLut> = emptyList(),
+    val selectedImportedLabel: String? = null,
+    val importedLutThumbnails: Map<String, Bitmap> = emptyMap(),
     val preview: Bitmap? = null,
     val isProcessing: Boolean = false,
 )

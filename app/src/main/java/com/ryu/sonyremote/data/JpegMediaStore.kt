@@ -5,7 +5,13 @@ import android.content.ContentValues
 import android.net.Uri
 import android.location.Location
 import android.os.Environment
+import android.os.Build
 import android.provider.MediaStore
+import android.content.ContentUris
+import android.util.Size
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import java.io.ByteArrayOutputStream
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.time.Instant
@@ -13,15 +19,72 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.ryu.sonyremote.model.OutputImageFormat
 
 class JpegMediaStore(private val contentResolver: ContentResolver) {
-    suspend fun save(jpeg: ByteArray, prefix: String = "SONY"): Uri = withContext(Dispatchers.IO) {
-        val normalizedJpeg = JpegValidator.normalize(jpeg)
+    suspend fun listSaved(): List<SavedMediaItem> = withContext(Dispatchers.IO) {
+        val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_ADDED,
+        )
+        contentResolver.query(
+            collection,
+            projection,
+            "${MediaStore.Images.Media.RELATIVE_PATH}=?",
+            arrayOf("${Environment.DIRECTORY_PICTURES}/Sony Remote/"),
+            "${MediaStore.Images.Media.DATE_ADDED} ASC",
+        )?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+            val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            buildList {
+                while (cursor.moveToNext()) {
+                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
+                    val thumbnail = runCatching {
+                        contentResolver.loadThumbnail(uri, Size(320, 320), null)
+                    }.getOrNull() ?: continue
+                    val attribution = readLutAttribution(uri)
+                    add(SavedMediaItem(
+                        uri, cursor.getString(nameColumn), cursor.getLong(dateColumn), thumbnail,
+                        attribution?.first, attribution?.second,
+                    ))
+                }
+            }
+        }.orEmpty()
+    }
+    suspend fun save(
+        image: ByteArray,
+        prefix: String = "SONY",
+        format: OutputImageFormat = OutputImageFormat.Jpeg,
+    ): Uri = withContext(Dispatchers.IO) {
+        val normalizedJpeg = JpegValidator.normalize(image)
+        val normalizedImage = if (format == OutputImageFormat.Jpeg) {
+            normalizedJpeg
+        } else {
+            val bitmap = requireNotNull(BitmapFactory.decodeByteArray(normalizedJpeg, 0, normalizedJpeg.size))
+            try {
+                ByteArrayOutputStream().use { output ->
+                    val webpFormat = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Bitmap.CompressFormat.WEBP_LOSSY
+                    } else {
+                        @Suppress("DEPRECATION")
+                        Bitmap.CompressFormat.WEBP
+                    }
+                    check(bitmap.compress(webpFormat, 95, output))
+                    output.toByteArray()
+                }
+            } finally {
+                bitmap.recycle()
+            }
+        }
         require(prefix.matches(FILE_PREFIX)) { "Invalid image filename prefix" }
-        val displayName = "${prefix}_${FILE_TIME_FORMAT.format(Instant.now())}.jpg"
+        val extension = if (format == OutputImageFormat.Webp) "webp" else "jpg"
+        val displayName = "${prefix}_${FILE_TIME_FORMAT.format(Instant.now())}.$extension"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.MIME_TYPE, if (format == OutputImageFormat.Webp) "image/webp" else "image/jpeg")
             put(
                 MediaStore.Images.Media.RELATIVE_PATH,
                 "${Environment.DIRECTORY_PICTURES}/Sony Remote",
@@ -35,7 +98,7 @@ class JpegMediaStore(private val contentResolver: ContentResolver) {
         try {
             contentResolver.openOutputStream(item, "w").use { output ->
                 requireNotNull(output) { "Android could not open the destination image" }
-                output.write(normalizedJpeg)
+                output.write(normalizedImage)
                 output.flush()
             }
             contentResolver.update(
@@ -80,8 +143,36 @@ class JpegMediaStore(private val contentResolver: ContentResolver) {
         }
     }
 
+    suspend fun setLutAttribution(destination: Uri, name: String, strength: Float) =
+        withContext(Dispatchers.IO) {
+            contentResolver.openFileDescriptor(destination, "rw").use { descriptor ->
+                val exif = ExifInterface(requireNotNull(descriptor).fileDescriptor)
+                val encodedName = android.util.Base64.encodeToString(
+                    name.toByteArray(), android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+                )
+                exif.setAttribute(
+                    ExifInterface.TAG_USER_COMMENT,
+                    "$LUT_COMMENT_PREFIX$encodedName:${strength.coerceIn(0f, 1f)}",
+                )
+                exif.saveAttributes()
+            }
+        }
+
+    private fun readLutAttribution(uri: Uri): Pair<String, Float>? = runCatching {
+        contentResolver.openFileDescriptor(uri, "r").use { descriptor ->
+            val value = ExifInterface(requireNotNull(descriptor).fileDescriptor)
+                .getAttribute(ExifInterface.TAG_USER_COMMENT)
+                ?.takeIf { it.startsWith(LUT_COMMENT_PREFIX) }
+                ?.removePrefix(LUT_COMMENT_PREFIX) ?: return@use null
+            val encodedName = value.substringBeforeLast(':')
+            val strength = value.substringAfterLast(':').toFloat()
+            String(android.util.Base64.decode(encodedName, android.util.Base64.URL_SAFE)) to strength
+        }
+    }.getOrNull()
+
     private companion object {
         val FILE_PREFIX = Regex("[A-Z0-9_]{1,32}")
+        const val LUT_COMMENT_PREFIX = "REMOTE_CAPTURE_LUT:"
         val COPIED_EXIF_TAGS = listOf(
             ExifInterface.TAG_MAKE,
             ExifInterface.TAG_MODEL,
@@ -115,3 +206,12 @@ class JpegMediaStore(private val contentResolver: ContentResolver) {
             DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS").withZone(ZoneOffset.UTC)
     }
 }
+
+data class SavedMediaItem(
+    val uri: Uri,
+    val name: String,
+    val dateAdded: Long,
+    val thumbnail: Bitmap,
+    val lutName: String? = null,
+    val lutStrength: Float? = null,
+)

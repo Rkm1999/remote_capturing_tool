@@ -70,15 +70,15 @@ class PhysicalShutterCaptureSupportTest {
     }
 
     @Test
-    fun continuousPhotoImportSelectsThumbnailBeforeRetainedPostview() {
+    fun continuousPhotoImportDownloadsReportedPostviewImmediately() {
         val thumbnail = URI("http://192.168.122.1/thumbnail/1.jpg")
         val postview = URI("http://192.168.122.1/postview/1.jpg?size=Original")
         val capture = RemoteCapture(CameraCaptureEventKind.Continuous, postview, thumbnail)
 
         val selected = selectRemoteCaptureDownload(capture, computational = false)
 
-        assertEquals(thumbnail, selected.uri)
-        assertTrue(selected.previewFirst)
+        assertEquals(postview, selected.uri)
+        assertFalse(selected.previewFirst)
     }
 
     @Test

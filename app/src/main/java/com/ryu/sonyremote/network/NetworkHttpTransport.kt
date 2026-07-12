@@ -51,13 +51,30 @@ class NetworkHttpTransport(
         }
     }
 
-    suspend fun readBytes(endpoint: URI, maxBytes: Int = 60 * 1024 * 1024): ByteArray =
+    suspend fun readBytes(
+        endpoint: URI,
+        maxBytes: Int = 60 * 1024 * 1024,
+        onProgress: ((bytesRead: Long, totalBytes: Long?) -> Unit)? = null,
+    ): ByteArray =
         withContext(Dispatchers.IO) {
             val connection = openConnection(endpoint).apply { readTimeout = DOWNLOAD_TIMEOUT_MILLIS }
             try {
                 connection.requireSuccess()
                 val expectedBytes = connection.contentLengthLong
-                val bytes = connection.inputStream.use { it.readLimited(maxBytes) }
+                val bytes = connection.inputStream.use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(total <= maxBytes) { "Camera response exceeded $maxBytes bytes" }
+                        output.write(buffer, 0, count)
+                        onProgress?.invoke(total, expectedBytes.takeIf { it >= 0 })
+                    }
+                    output.toByteArray()
+                }
                 require(expectedBytes < 0 || bytes.size.toLong() == expectedBytes) {
                     "Camera download ended early: received ${bytes.size} of $expectedBytes bytes"
                 }

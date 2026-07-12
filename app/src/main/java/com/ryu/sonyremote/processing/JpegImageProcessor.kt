@@ -3,11 +3,64 @@ package com.ryu.sonyremote.processing
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
 class JpegImageProcessor {
+    fun editPreview(
+        jpeg: ByteArray,
+        preset: LutPreset,
+        intensity: Float,
+        exposure: Float,
+        contrast: Float,
+        saturation: Float,
+    ): Bitmap = applyBasicEdits(
+        applyLut(decode(jpeg, maxEdge = PREVIEW_EDGE, mutable = true), preset, intensity),
+        exposure,
+        contrast,
+        saturation,
+    )
+
+    fun applyEditsToJpeg(
+        jpeg: ByteArray,
+        preset: LutPreset,
+        intensity: Float,
+        exposure: Float,
+        contrast: Float,
+        saturation: Float,
+    ): ByteArray {
+        val bitmap = applyBasicEdits(
+            applyLut(decode(jpeg, maxEdge = null, mutable = true), preset, intensity),
+            exposure,
+            contrast,
+            saturation,
+        )
+        return try { encode(bitmap, JPEG_QUALITY) } finally { bitmap.recycle() }
+    }
+
+    fun editPreview(
+        jpeg: ByteArray, lut: CubeLut, intensity: Float,
+        exposure: Float, contrast: Float, saturation: Float,
+    ): Bitmap = applyBasicEdits(
+        applyLut(decode(jpeg, maxEdge = PREVIEW_EDGE, mutable = true), lut, intensity),
+        exposure, contrast, saturation,
+    )
+
+    fun applyEditsToJpeg(
+        jpeg: ByteArray, lut: CubeLut, intensity: Float,
+        exposure: Float, contrast: Float, saturation: Float,
+    ): ByteArray {
+        val bitmap = applyBasicEdits(
+            applyLut(decode(jpeg, maxEdge = null, mutable = true), lut, intensity),
+            exposure, contrast, saturation,
+        )
+        return try { encode(bitmap, JPEG_QUALITY) } finally { bitmap.recycle() }
+    }
     fun thumbnail(jpeg: ByteArray, maxEdge: Int = THUMBNAIL_EDGE): Bitmap =
         decode(jpeg, maxEdge = maxEdge, mutable = false)
 
@@ -120,6 +173,33 @@ class JpegImageProcessor {
         val oriented = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         if (oriented !== bitmap) bitmap.recycle()
         return oriented
+    }
+
+    private fun applyBasicEdits(
+        bitmap: Bitmap,
+        exposure: Float,
+        contrast: Float,
+        saturation: Float,
+    ): Bitmap {
+        if (exposure == 0f && contrast == 0f && saturation == 0f) return bitmap
+        val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        val matrix = ColorMatrix().apply {
+            setSaturation((1f + saturation).coerceIn(0f, 2f))
+            val contrastScale = (1f + contrast).coerceIn(0.25f, 2f)
+            val exposureOffset = exposure.coerceIn(-1f, 1f) * 96f
+            val translate = 128f * (1f - contrastScale) + exposureOffset
+            postConcat(ColorMatrix(floatArrayOf(
+                contrastScale, 0f, 0f, 0f, translate,
+                0f, contrastScale, 0f, 0f, translate,
+                0f, 0f, contrastScale, 0f, translate,
+                0f, 0f, 0f, 1f, 0f,
+            )))
+        }
+        Canvas(output).drawBitmap(bitmap, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(matrix)
+        })
+        bitmap.recycle()
+        return output
     }
 
     private fun calculateSampleSize(width: Int, height: Int, maxEdge: Int): Int {

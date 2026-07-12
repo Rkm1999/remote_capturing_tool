@@ -116,6 +116,8 @@ enum class PostviewSizePreference(val wireValue: String) {
     FastPreview("2M"),
 }
 
+enum class OutputImageFormat { Jpeg, Webp }
+
 data class CapturedImage(
     val remoteUri: URI,
     val postviewSize: String?,

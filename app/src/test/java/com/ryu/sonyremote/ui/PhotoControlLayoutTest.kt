@@ -10,6 +10,12 @@ import org.junit.Test
 
 class PhotoControlLayoutTest {
     @Test
+    fun calculatesLiveNdExposureFromShutterAndFrames() {
+        assertEquals("625ms", liveNdExposureLabel("1/8", 4))
+        assertEquals("10s", liveNdExposureLabel("2", 4))
+        assertEquals(null, liveNdExposureLabel("BULB", 8))
+    }
+    @Test
     fun mapsKnownExposureModesAndPreservesUnknownLabels() {
         assertEquals("P", exposureModeShortLabel("Program Auto"))
         assertEquals("A", exposureModeShortLabel("Aperture Priority"))
