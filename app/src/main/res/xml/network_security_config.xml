@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Legacy Sony cameras expose their local JSON-RPC and live-view services over HTTP. -->
+    <!--suppress InsecureBaseConfiguration -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
