@@ -570,6 +570,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     highestBurstSpeed(ready.capabilities.settings[CameraSettingId.ContShootingSpeed])
                         ?.let { desired[CameraSettingId.ContShootingSpeed] = it }
                     modeCameraSettings[mode] = desired
+                } else if (mode == CaptureMode.LiveComposite || mode == CaptureMode.Panorama) {
+                    ready.capabilities.settings[CameraSettingId.ContShootingMode]
+                        ?.options?.firstOrNull { it.wireValue.equals("Single", true) }
+                        ?.let { desired[CameraSettingId.ContShootingMode] = it.wireValue }
+                    modeCameraSettings[mode] = desired
                 }
                 desired.forEach { (id, value) ->
                     val current = (connection.value as? ConnectionState.Ready)
