@@ -24,8 +24,11 @@ API and exposes only capabilities reported by the connected camera.
 - Live-view 3D LUT preview and separate full-resolution derivatives with EXIF preservation
 - Import, preview, strength adjustment, and application of 3D `.cube` LUT files
 - Direct Lumix Lab ZIP sharing with persistent multi-LUT import
+- Persistent live-view LUT selection and an always-visible active-LUT indicator
 - Full-screen photo editor with LUT attribution, strength, exposure, contrast,
-  saturation, and saved derivative copies
+  saturation, RawRefinery denoise/deep sharpening, and saved derivative copies
+- Optional automatic full-resolution denoise for every photo or above a selected ISO
+- Retained private originals so LUT-baked photos can be re-edited from camera data
 - JPEG or WebP output selection
 - Optional phone-location geotagging in the EXIF of every saved JPEG
 - Progressive Live ND averaging with Burst and Single capture strategies
@@ -34,6 +37,8 @@ API and exposes only capabilities reported by the connected camera.
   live registration, feathered blending, Finish, and final JPEG saving
 - Capability-driven capture type, drive, exposure, aperture, shutter, ISO, and EV controls
 - Immediate Wi-Fi-loss handling and exportable local diagnostics
+- Encrypted paired-camera credentials with foreground Wi-Fi auto-connect and retry
+- Configurable live-view inactivity timeout to reduce camera battery use
 - Preview and capability polling pause while the app is backgrounded
 
 The app never requests general photo-library access. Captured JPEGs are written
@@ -106,7 +111,8 @@ Panorama keep the main grid focused on their final rendered results.
 
 <img src="docs/screenshots/photo-editor.png" alt="Full-screen editor with LUT strength, basic adjustments, and LUT filmstrip" width="320">
 
-Editing provides LUT strength plus exposure, contrast, and saturation controls.
+Editing provides LUT strength, exposure, contrast, saturation, RawRefinery Light
+denoise, and deep-sharpen controls.
 Built-in and imported `.cube` LUTs appear in the bottom filmstrip. Photos saved
 with a LUT retain its name and strength in EXIF so the editor can restore the
 recorded selection later; edits are saved as a new copy.
@@ -118,14 +124,14 @@ that exposes the legacy ScalarWebAPI camera service. Compatibility is
 capability-driven: unavailable camera APIs result in unavailable or read-only UI
 controls rather than assumed support.
 
-**Hardware tested for v0.2 beta:**
+**Hardware tested for v0.3 beta:**
 
 - Samsung Galaxy S25 (`SM-S931W`), Android 16
 - Sony Alpha A6300 (`ILCE-6300`)
 - Sony Smart Remote Embedded / legacy Smart Remote Control camera application
 - Still capture, physical shutter import, continuous shooting, exposure controls,
   remote zoom, Standard/High live view, Live ND, Live Composite, Panorama, LUT
-  preview/import, and MediaStore saving
+  preview/import, RawRefinery processing, paired Wi-Fi reconnect, and MediaStore saving
 
 Other Sony models using the same legacy service may work but are untested. Sony's
 newer Camera Remote SDK cameras are not automatically compatible with this app.
@@ -237,7 +243,7 @@ ANDROID_SERIAL=<device-serial> ./gradlew connectedDebugAndroidTest
 
 The debug APK is produced at `app/build/outputs/apk/debug/app-debug.apk`.
 
-The `v0.2-beta` GitHub prerelease provides a debug-key-signed APK for direct
+The `v0.3-beta` GitHub prerelease provides a debug-key-signed APK for direct
 testing. It is not a production-signed Play Store artifact. Android may require
 permission to install apps from the browser or file manager used to open it.
 

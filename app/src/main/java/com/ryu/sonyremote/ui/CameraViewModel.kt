@@ -40,6 +40,9 @@ import com.ryu.sonyremote.processing.PanoramaFinalRenderer
 import com.ryu.sonyremote.processing.PanoramaRenderPlanner
 import com.ryu.sonyremote.processing.PanoramaResourceBudget
 import com.ryu.sonyremote.processing.PanoramaSourceDimensions
+import com.ryu.sonyremote.processing.RawRefineryProcessor
+import com.ryu.sonyremote.network.PairedCamera
+import com.ryu.sonyremote.network.PairedCameraStore
 import java.io.IOException
 import java.io.ByteArrayInputStream
 import java.util.UUID
@@ -75,9 +78,11 @@ data class UiMessage(
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = SonyCameraRepository(application)
-    private val workspace = CaptureWorkspace(application.cacheDir)
-    private val imageProcessor = JpegImageProcessor()
+    private val workspace = CaptureWorkspace(application.filesDir)
+    private val rawRefineryProcessor = RawRefineryProcessor(application)
+    private val imageProcessor = JpegImageProcessor(rawRefineryProcessor)
     private val preferences = application.getSharedPreferences("settings", 0)
+    private val pairedCameraStore = PairedCameraStore(application)
 
     val connection: StateFlow<ConnectionState> = repository.connection
     val isStreaming: StateFlow<Boolean> = repository.isStreaming
@@ -99,6 +104,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _permissionBlocked = MutableStateFlow(false)
     val permissionBlocked: StateFlow<Boolean> = _permissionBlocked.asStateFlow()
+    private val _pairedCameras = MutableStateFlow(pairedCameraStore.load())
+    val pairedCameras: StateFlow<List<PairedCamera>> = _pairedCameras.asStateFlow()
     private val _geotaggingEnabled = MutableStateFlow(preferences.getBoolean("geotagging", false))
     val geotaggingEnabled: StateFlow<Boolean> = _geotaggingEnabled.asStateFlow()
     private val _automaticPostviewPreference = MutableStateFlow(
@@ -114,6 +121,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }.getOrDefault(OutputImageFormat.Jpeg),
     )
     val outputImageFormat: StateFlow<OutputImageFormat> = _outputImageFormat.asStateFlow()
+    private val _autoDenoiseMode = MutableStateFlow(
+        runCatching {
+            AutoDenoiseMode.valueOf(preferences.getString("auto_denoise_mode", null) ?: "Off")
+        }.getOrDefault(AutoDenoiseMode.Off),
+    )
+    val autoDenoiseMode: StateFlow<AutoDenoiseMode> = _autoDenoiseMode.asStateFlow()
+    private val _autoDenoiseIsoThreshold = MutableStateFlow(
+        preferences.getInt("auto_denoise_iso_threshold", DEFAULT_AUTO_DENOISE_ISO),
+    )
+    val autoDenoiseIsoThreshold: StateFlow<Int> = _autoDenoiseIsoThreshold.asStateFlow()
+    private val _liveViewTimeoutMinutes = MutableStateFlow(
+        preferences.getInt("live_view_timeout_minutes", 0),
+    )
+    val liveViewTimeoutMinutes: StateFlow<Int> = _liveViewTimeoutMinutes.asStateFlow()
 
     private val _captureMode = MutableStateFlow(CaptureMode.Photo)
     val captureMode: StateFlow<CaptureMode> = _captureMode.asStateFlow()
@@ -133,7 +154,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _lutEditor = MutableStateFlow<LutEditorUiState?>(null)
     val lutEditor: StateFlow<LutEditorUiState?> = _lutEditor.asStateFlow()
 
-    private val _lutCaptureState = MutableStateFlow(LutCaptureState())
+    private val _lutCaptureState = MutableStateFlow(restoredPresetLutState())
     val lutCaptureState: StateFlow<LutCaptureState> = _lutCaptureState.asStateFlow()
 
     private val _lutPreviews = MutableStateFlow(
@@ -149,10 +170,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var commandJob: Job? = null
     private var pollJob: Job? = null
     private var liveViewRestartJob: Job? = null
+    private var liveViewTimeoutJob: Job? = null
+    private var autoReconnectJob: Job? = null
     private var liveViewStartupFailures = 0
     private var lifecycleJob: Job? = null
     private var sessionJob: Job? = null
     private var lutJob: Job? = null
+    private var editorPreviewJob: Job? = null
+    private var editorPreviewRequests: Channel<Pair<Long, LutEditorUiState>>? = null
+    private var editorPreviewBase: Bitmap? = null
+    private var editorPreviewGeneration = 0L
     private var physicalCaptureJob: Job? = null
     private var continuousBurstJob: Job? = null
     private var zoomTargetJob: Job? = null
@@ -176,10 +203,23 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     @Volatile private var sessionStopRequested = false
     private var isForeground = false
     private var isDisconnecting = false
+    private var suppressAutoReconnect = false
 
     init {
         repository.setGeotaggingEnabled(_geotaggingEnabled.value)
         repository.setOutputImageFormat(_outputImageFormat.value)
+        viewModelScope.launch {
+            connection.collect { state ->
+                if (
+                    state is ConnectionState.Failed &&
+                    isForeground &&
+                    !isDisconnecting &&
+                    !suppressAutoReconnect
+                ) {
+                    scheduleAutoReconnect()
+                }
+            }
+        }
         viewModelScope.launch(Dispatchers.IO) {
             val directory = getApplication<Application>().getDir(IMPORTED_LUT_DIRECTORY, 0)
             val stored = directory.listFiles().orEmpty().mapNotNull { file ->
@@ -190,11 +230,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
             if (stored.isEmpty()) return@launch
             withContext(Dispatchers.Main) {
-                stored.forEach { lut ->
-                    if (_lutCaptureState.value.importedLuts.none { it.label == lut.label }) {
-                        _lutCaptureState.value = _lutCaptureState.value.import(lut)
-                    }
+                val current = _lutCaptureState.value
+                val merged = current.importedLuts + stored.filter { loaded ->
+                    current.importedLuts.none { it.label == loaded.label }
                 }
+                val savedImported = preferences.getString(LUT_SELECTION_NAME, null)
+                    ?.takeIf { preferences.getString(LUT_SELECTION_TYPE, LUT_TYPE_PRESET) == LUT_TYPE_IMPORTED }
+                    ?.takeIf { label -> merged.any { it.label == label } }
+                val savedIntensity = preferences.getFloat(LUT_SELECTION_INTENSITY, 1f).coerceIn(0f, 1f)
+                _lutCaptureState.value = current.copy(
+                    importedLuts = merged,
+                    selectedImportedLabel = savedImported,
+                    importedIntensities = current.importedIntensities + merged.associate { it.label to
+                        if (it.label == savedImported) savedIntensity else 1f
+                    },
+                )
             }
         }
         viewModelScope.launch {
@@ -216,7 +266,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
             val pendingSources = mutableListOf<String>()
-            val restored = restoredWithoutRelations.map { item ->
+            val legacyRestored = restoredWithoutRelations.map { item ->
                 when (item.kind) {
                     CaptureAssetKind.SourceFrame -> item.also { pendingSources += it.id }
                     CaptureAssetKind.LiveNd,
@@ -226,27 +276,74 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     else -> item
                 }
             }
+            val restored = buildList {
+                legacyRestored.forEach { item ->
+                    val media = item.source as? CaptureAssetSource.MediaStore
+                    val privateSources = if (
+                        media != null && item.kind in setOf(
+                            CaptureAssetKind.LiveNd,
+                            CaptureAssetKind.LiveComposite,
+                            CaptureAssetKind.Panorama,
+                        )
+                    ) {
+                        workspace.relatedItems(media.uri.toString())
+                    } else {
+                        emptyList()
+                    }
+                    val sourceItems = privateSources.mapIndexed { index, source ->
+                        val jpeg = workspace.readBytes(source)
+                        FilmstripItem(
+                            id = source.name,
+                            kind = CaptureAssetKind.SourceFrame,
+                            title = "Source ${index + 1}",
+                            source = CaptureAssetSource.Workspace(source),
+                            thumbnail = withContext(Dispatchers.Default) { imageProcessor.thumbnail(jpeg) },
+                        )
+                    }
+                    addAll(sourceItems)
+                    add(item.copy(
+                        relatedSourceIds = sourceItems.map(FilmstripItem::id)
+                            .ifEmpty { item.relatedSourceIds },
+                    ))
+                }
+            }
             if (restored.isNotEmpty()) {
                 val restoredIds = restored.map(FilmstripItem::id).toSet()
                 _filmstrip.value = restored + _filmstrip.value.filterNot { it.id in restoredIds }
             }
         }
         viewModelScope.launch {
-            _lutCaptureState.collect { lut ->
+            combine(
+                _lutCaptureState,
+                _autoDenoiseMode,
+                _autoDenoiseIsoThreshold,
+            ) { lut, denoiseMode, isoThreshold -> Triple(lut, denoiseMode, isoThreshold) }
+                .collect { (lut, denoiseMode, isoThreshold) ->
                 repository.setDownloadedImageProcessor { jpeg ->
-                    if (_captureMode.value != CaptureMode.Photo || lut.isOriginal) {
+                    if (_captureMode.value != CaptureMode.Photo) {
                         jpeg
                     } else {
                         withContext(Dispatchers.Default) {
+                            val denoiseStrength = if (shouldAutoDenoise(
+                                    denoiseMode,
+                                    imageProcessor.photographicSensitivity(jpeg),
+                                    isoThreshold,
+                                )) AUTO_DENOISE_STRENGTH else 0f
+                            if (lut.isOriginal && denoiseStrength == 0f) return@withContext jpeg
                             lut.importedLut?.takeIf { lut.importedSelected }?.let {
-                                imageProcessor.applyLutToJpeg(jpeg, it.cube, lut.intensity)
-                            } ?: imageProcessor.applyLutToJpeg(jpeg, lut.preset, lut.intensity)
+                                imageProcessor.applyEditsToJpeg(
+                                    jpeg, it.cube, lut.intensity, 0f, 0f, 0f,
+                                    denoiseStrength = denoiseStrength,
+                                )
+                            } ?: imageProcessor.applyEditsToJpeg(
+                                jpeg, lut.preset, lut.intensity, 0f, 0f, 0f,
+                                denoiseStrength = denoiseStrength,
+                            )
                         }
                     }
                 }
             }
         }
-        viewModelScope.launch { workspace.clear() }
         viewModelScope.launch {
             var lastDecodedTimestamp = 0L
             var lastLutState = _lutCaptureState.value
@@ -375,8 +472,60 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         preferences.edit().putString("output_format", format.name).apply()
     }
 
+    fun setAutoDenoiseMode(mode: AutoDenoiseMode) {
+        _autoDenoiseMode.value = mode
+        preferences.edit().putString("auto_denoise_mode", mode.name).apply()
+    }
+
+    fun setAutoDenoiseIsoThreshold(iso: Int) {
+        _autoDenoiseIsoThreshold.value = iso.coerceAtLeast(100)
+        preferences.edit().putInt("auto_denoise_iso_threshold", _autoDenoiseIsoThreshold.value).apply()
+    }
+
+    fun setLiveViewTimeoutMinutes(minutes: Int) {
+        _liveViewTimeoutMinutes.value = minutes.coerceAtLeast(0)
+        preferences.edit().putInt("live_view_timeout_minutes", _liveViewTimeoutMinutes.value).apply()
+        scheduleLiveViewTimeout()
+    }
+
     fun connect() {
+        connectToCameras(listOf(null))
+    }
+
+    fun pairAndConnectCamera(ssid: String, password: String, autoConnect: Boolean) {
+        require(ssid.isNotBlank()) { "Camera Wi-Fi name is required" }
+        require(password.length >= 8) { "Camera Wi-Fi password must be at least 8 characters" }
+        _pairedCameras.value = pairedCameraStore.save(ssid, password, autoConnect)
+        connectPairedCamera(ssid.trim())
+    }
+
+    fun connectPairedCamera(id: String) {
+        val camera = _pairedCameras.value.firstOrNull { it.id == id } ?: return
+        if (camera.canRequestWifi) {
+            connectToCameras(listOf(camera))
+        } else {
+            viewModelScope.launch {
+                if (repository.awaitCurrentWifiSsid() == camera.ssid) {
+                    connectToCameras(listOf(camera))
+                } else {
+                    _message.value = UiMessage("Join ${camera.displayName} Wi-Fi before connecting", true)
+                }
+            }
+        }
+    }
+
+    fun setPairedCameraAutoConnect(id: String, enabled: Boolean) {
+        _pairedCameras.value = pairedCameraStore.setAutoConnect(id, enabled)
+    }
+
+    fun forgetPairedCamera(id: String) {
+        _pairedCameras.value = pairedCameraStore.remove(id)
+    }
+
+    private fun connectToCameras(cameras: List<PairedCamera?>) {
         if (connectionJob?.isActive == true) return
+        suppressAutoReconnect = false
+        autoReconnectJob?.cancel()
         isDisconnecting = false
         connectionJob = viewModelScope.launch {
             _isBusy.value = true
@@ -392,21 +541,66 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _isBusy.value = true
             try {
                 _permissionBlocked.value = false
-                val ready = repository.connect()
+                var lastFailure: Throwable? = null
+                var ready: ConnectionState.Ready? = null
+                for (camera in cameras) {
+                    try {
+                        ready = if (camera == null) {
+                            repository.connect()
+                        } else if (!camera.canRequestWifi) {
+                            repository.connect()
+                        } else {
+                            repository.connect(camera.ssid, pairedCameraStore.password(camera))
+                        }
+                        break
+                    } catch (error: Throwable) {
+                        if (error is CancellationException) throw error
+                        lastFailure = error
+                    }
+                }
+                val connected = ready ?: throw lastFailure ?: IOException("No paired camera is available")
+                val discoveredSsid = repository.connectedWifiSsid()
+                    ?: cameras.firstOrNull { it?.canRequestWifi == true }?.ssid
+                val identity = discoveredSsid ?: "sony:${connected.device.friendlyName}:${connected.device.modelName}"
+                _pairedCameras.value = pairedCameraStore.rememberDiscovered(
+                    id = identity,
+                    displayName = connected.device.friendlyName.ifBlank { connected.device.modelName },
+                    ssid = discoveredSsid.orEmpty(),
+                )
                 runCatching { repository.setAutomaticPostviewPreference(_automaticPostviewPreference.value) }
-                _message.value = UiMessage("Connected to ${ready.device.modelName}")
-                if (isForeground && ready.capabilities.canLiveView) startLiveView()
+                _message.value = UiMessage("Connected to ${connected.device.modelName}")
+                if (isForeground && connected.capabilities.canLiveView) startLiveView()
                 if (isForeground) startStatePolling()
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 _message.value = UiMessage(error.readableMessage("Could not connect to the camera"), true)
             } finally {
                 _isBusy.value = false
+                val retryCameras = _pairedCameras.value.filter { it.autoConnect }
+                if (
+                    connection.value is ConnectionState.Failed &&
+                    !suppressAutoReconnect &&
+                    retryCameras.isNotEmpty()
+                ) {
+                    autoReconnectJob = viewModelScope.launch {
+                        delay(AUTO_RECONNECT_DELAY_MILLIS)
+                        while (isForeground && !isDisconnecting && !suppressAutoReconnect) {
+                            val eligible = eligibleAutoConnectCameras(retryCameras)
+                            if (eligible.isNotEmpty()) {
+                                connectToCameras(eligible)
+                                return@launch
+                            }
+                            delay(AUTO_RECONNECT_DELAY_MILLIS)
+                        }
+                    }
+                }
             }
         }
     }
 
     fun disconnect() {
+        suppressAutoReconnect = true
+        autoReconnectJob?.cancel()
         isDisconnecting = true
         sessionStopRequested = true
         connectionJob?.cancel()
@@ -421,6 +615,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         activeOriginalImportJob?.cancel()
         pollJob?.cancel()
         liveViewRestartJob?.cancel()
+        liveViewTimeoutJob?.cancel()
         liveViewJob?.cancel()
         lifecycleJob?.cancel()
         repository.cancelActiveIo()
@@ -716,6 +911,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         lutJob?.cancel()
+        editorPreviewRequests?.close()
+        editorPreviewRequests = null
+        editorPreviewJob?.cancel()
+        editorPreviewBase?.let(::scheduleBitmapRecycle)
+        editorPreviewBase = null
+        editorPreviewGeneration++
         val selected = _lutCaptureState.value
         val capturedPreset = item.appliedLutName?.let { name ->
             LutPreset.entries.firstOrNull { it.label == name }
@@ -723,25 +924,29 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val capturedImported = item.appliedLutName?.let { name ->
             selected.importedLuts.firstOrNull { it.label == name }
         }
-        publishLutEditor(LutEditorUiState(
+        val initialState = LutEditorUiState(
             item = item,
             preset = capturedPreset ?: selected.preset,
             intensity = item.appliedLutStrength ?: selected.intensity,
             importedLuts = selected.importedLuts,
             selectedImportedLabel = capturedImported?.label,
             isProcessing = true,
-        ))
+        )
+        publishLutEditor(initialState)
         lutJob = viewModelScope.launch {
             try {
-                val jpeg = readAssetBytes(item.source)
+                val jpeg = readEditorSourceBytes(item)
+                val base = withContext(Dispatchers.Default) {
+                    imageProcessor.prepareEditorPreview(jpeg)
+                }
                 val preview = withContext(Dispatchers.Default) {
                     if (capturedImported != null) {
-                        imageProcessor.editPreview(
-                            jpeg, capturedImported.cube,
+                        imageProcessor.renderEditorPreview(
+                            base, capturedImported.cube,
                             item.appliedLutStrength ?: selected.intensity, 0f, 0f, 0f,
                         )
-                    } else imageProcessor.editPreview(
-                        jpeg, capturedPreset ?: selected.preset,
+                    } else imageProcessor.renderEditorPreview(
+                        base, capturedPreset ?: selected.preset,
                         item.appliedLutStrength ?: selected.intensity, 0f, 0f, 0f,
                     )
                 }
@@ -762,6 +967,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
                 if (_lutEditor.value?.item?.id == item.id) {
+                    editorPreviewBase?.let(::scheduleBitmapRecycle)
+                    editorPreviewBase = base
+                    startEditorPreviewWorker()
                     publishLutEditor(LutEditorUiState(
                         item = item,
                         preset = capturedPreset ?: selected.preset,
@@ -773,6 +981,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         importedLutThumbnails = importedThumbnails,
                     ))
                 } else {
+                    scheduleBitmapRecycle(base)
                     scheduleBitmapRecycle(preview)
                 }
             } catch (error: Throwable) {
@@ -783,101 +992,84 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun selectLut(preset: LutPreset) {
-        val editor = _lutEditor.value ?: return
-        _lutCaptureState.value = _lutCaptureState.value.copy(preset = preset)
-        lutJob?.cancel()
-        publishLutEditor(editor.copy(preset = preset, selectedImportedLabel = null, isProcessing = true))
-        lutJob = viewModelScope.launch {
-            try {
-                val jpeg = readAssetBytes(editor.item.source)
+    suspend fun loadGalleryDetail(item: FilmstripItem): Bitmap {
+        val jpeg = readAssetBytes(item.source)
+        return withContext(Dispatchers.Default) { imageProcessor.thumbnail(jpeg, maxEdge = 2_048) }
+    }
+
+    private fun startEditorPreviewWorker() {
+        editorPreviewRequests?.close()
+        editorPreviewJob?.cancel()
+        val requests = Channel<Pair<Long, LutEditorUiState>>(Channel.CONFLATED)
+        editorPreviewRequests = requests
+        editorPreviewJob = viewModelScope.launch {
+            for ((generation, requested) in requests) {
+                val base = editorPreviewBase ?: continue
                 val preview = withContext(Dispatchers.Default) {
-                    imageProcessor.editPreview(
-                        jpeg, preset, editor.intensity,
-                        editor.exposure, editor.contrast, editor.saturation,
-                    )
+                    val imported = requested.importedLuts.firstOrNull {
+                        it.label == requested.selectedImportedLabel
+                    }
+                    if (imported != null) {
+                        imageProcessor.renderEditorPreview(
+                            base, imported.cube, requested.intensity,
+                            requested.exposure, requested.contrast, requested.saturation,
+                        )
+                    } else {
+                        imageProcessor.renderEditorPreview(
+                            base, requested.preset, requested.intensity,
+                            requested.exposure, requested.contrast, requested.saturation,
+                        )
+                    }
                 }
                 val current = _lutEditor.value
-                if (current?.item?.id == editor.item.id && current.preset == preset) {
+                if (generation == editorPreviewGeneration && current?.item?.id == requested.item.id) {
                     publishLutEditor(current.copy(preview = preview, isProcessing = false))
                 } else {
                     scheduleBitmapRecycle(preview)
                 }
-            } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                publishLutEditor(editor.copy(isProcessing = false))
-                _message.value = UiMessage(error.readableMessage("Could not preview this LUT"), true)
             }
         }
+    }
+
+    private fun renderCachedEditorPreview(updated: LutEditorUiState) {
+        if (editorPreviewBase == null) return
+        val generation = ++editorPreviewGeneration
+        publishLutEditor(updated.copy(isProcessing = false))
+        editorPreviewRequests?.trySend(generation to updated)
+    }
+
+    fun selectLut(preset: LutPreset) {
+        val editor = _lutEditor.value ?: return
+        renderCachedEditorPreview(editor.copy(preset = preset, selectedImportedLabel = null))
     }
 
     fun selectEditorImportedLut(label: String) {
         val editor = _lutEditor.value ?: return
         val imported = editor.importedLuts.firstOrNull { it.label == label } ?: return
-        lutJob?.cancel()
-        publishLutEditor(editor.copy(selectedImportedLabel = label, isProcessing = true))
-        lutJob = viewModelScope.launch {
-            try {
-                val jpeg = readAssetBytes(editor.item.source)
-                val preview = withContext(Dispatchers.Default) {
-                    imageProcessor.editPreview(
-                        jpeg, imported.cube, editor.intensity,
-                        editor.exposure, editor.contrast, editor.saturation,
-                    )
-                }
-                val current = _lutEditor.value
-                if (current?.item?.id == editor.item.id && current.selectedImportedLabel == label) {
-                    publishLutEditor(current.copy(preview = preview, isProcessing = false))
-                } else scheduleBitmapRecycle(preview)
-            } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                publishLutEditor(editor.copy(isProcessing = false))
-                _message.value = UiMessage(error.readableMessage("Could not preview this LUT"), true)
-            }
-        }
+        renderCachedEditorPreview(editor.copy(selectedImportedLabel = label))
     }
 
     fun selectLiveLut(preset: LutPreset) {
         _lutCaptureState.value = _lutCaptureState.value.select(preset)
+        persistLiveLutState()
         repository.latestFrame.value?.jpeg?.let { scheduleLutPreviewStrip(it, force = true) }
     }
 
     fun setLutIntensity(intensity: Float) {
         val normalized = intensity.coerceIn(0f, 1f)
+        val editor = _lutEditor.value
+        if (editor != null) {
+            renderCachedEditorPreview(editor.copy(intensity = normalized))
+            return
+        }
         val state = _lutCaptureState.value
         _lutCaptureState.value = if (state.importedSelected) {
             state.withImportedIntensity(normalized)
         } else {
             state.withIntensity(state.preset, normalized)
         }
+        persistLiveLutState()
         repository.latestFrame.value?.jpeg?.let { scheduleLutPreviewStrip(it, force = true) }
-        val editor = _lutEditor.value ?: return
-        lutJob?.cancel()
-        publishLutEditor(editor.copy(intensity = normalized, isProcessing = true))
-        lutJob = viewModelScope.launch {
-            try {
-                val jpeg = readAssetBytes(editor.item.source)
-                val preview = withContext(Dispatchers.Default) {
-                    val imported = editor.importedLuts.firstOrNull { it.label == editor.selectedImportedLabel }
-                    if (imported != null) imageProcessor.editPreview(
-                        jpeg, imported.cube, normalized,
-                        editor.exposure, editor.contrast, editor.saturation,
-                    ) else imageProcessor.editPreview(
-                        jpeg, editor.preset, normalized,
-                        editor.exposure, editor.contrast, editor.saturation,
-                    )
-                }
-                val current = _lutEditor.value
-                if (current?.item?.id == editor.item.id && current.intensity == normalized) {
-                    publishLutEditor(current.copy(preview = preview, isProcessing = false))
-                } else {
-                    scheduleBitmapRecycle(preview)
-                }
-            } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                publishLutEditor(editor.copy(intensity = normalized, isProcessing = false))
-            }
-        }
     }
 
     fun addLiveLut(preset: LutPreset) {
@@ -890,28 +1082,54 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             exposure = exposure.coerceIn(-1f, 1f),
             contrast = contrast.coerceIn(-1f, 1f),
             saturation = saturation.coerceIn(-1f, 1f),
-            isProcessing = true,
         )
+        renderCachedEditorPreview(updated)
+    }
+
+    fun setEditorDenoiseEnabled(enabled: Boolean) = updateEditorRawEffects {
+        it.copy(denoiseEnabled = enabled)
+    }
+
+    fun setEditorDenoiseStrength(strength: Float) = updateEditorRawEffects {
+        it.copy(denoiseStrength = strength.coerceIn(0f, 1f))
+    }
+
+    fun setEditorSharpenEnabled(enabled: Boolean) = updateEditorRawEffects {
+        it.copy(sharpenEnabled = enabled)
+    }
+
+    fun setEditorSharpenStrength(strength: Float) = updateEditorRawEffects {
+        it.copy(sharpenStrength = strength.coerceIn(0f, 1f))
+    }
+
+    private fun updateEditorRawEffects(transform: (LutEditorUiState) -> LutEditorUiState) {
+        val editor = _lutEditor.value ?: return
+        val updated = transform(editor).copy(isProcessing = true)
         lutJob?.cancel()
         publishLutEditor(updated)
         lutJob = viewModelScope.launch {
             try {
-                val jpeg = readAssetBytes(editor.item.source)
-                val preview = withContext(Dispatchers.Default) {
-                    val imported = updated.importedLuts.firstOrNull { it.label == updated.selectedImportedLabel }
-                    if (imported != null) imageProcessor.editPreview(
-                        jpeg, imported.cube, updated.intensity,
-                        updated.exposure, updated.contrast, updated.saturation,
-                    ) else imageProcessor.editPreview(
-                        jpeg, updated.preset, updated.intensity,
-                        updated.exposure, updated.contrast, updated.saturation,
+                delay(EDITOR_EFFECT_DEBOUNCE_MILLIS)
+                val jpeg = readEditorSourceBytes(updated.item)
+                val base = withContext(Dispatchers.Default) {
+                    imageProcessor.prepareEditorPreview(
+                        jpeg,
+                        updated.effectiveDenoiseStrength,
+                        updated.effectiveSharpenStrength,
+                        updated.denoiseModel,
                     )
                 }
-                if (_lutEditor.value === updated) publishLutEditor(updated.copy(preview = preview, isProcessing = false))
-                else scheduleBitmapRecycle(preview)
+                if (_lutEditor.value === updated) {
+                    editorPreviewBase?.let(::scheduleBitmapRecycle)
+                    editorPreviewBase = base
+                    renderCachedEditorPreview(updated)
+                } else scheduleBitmapRecycle(base)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                publishLutEditor(updated.copy(isProcessing = false))
+                if (_lutEditor.value?.item?.id == updated.item.id) {
+                    publishLutEditor(updated.copy(isProcessing = false))
+                    _message.value = UiMessage(error.readableMessage("Could not apply image effect"), true)
+                }
             }
         }
     }
@@ -923,10 +1141,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun importCubeLut(name: String, text: String) {
         runCatching {
-            val label = name.substringBeforeLast('.').ifBlank { "Imported LUT" }
+            val label = uniqueImportedLutLabel(
+                name,
+                _lutCaptureState.value.importedLuts.map(ImportedLut::label).toSet(),
+            )
             ImportedLut(label, CubeLut.parse(text))
         }.onSuccess { imported ->
             _lutCaptureState.value = _lutCaptureState.value.import(imported)
+            persistLiveLutState()
             viewModelScope.launch(Dispatchers.IO) {
                 val encoded = Base64.encodeToString(
                     imported.label.toByteArray(),
@@ -949,6 +1171,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectImportedLut(label: String) {
         _lutCaptureState.value = _lutCaptureState.value.selectImported(label)
+        persistLiveLutState()
         repository.latestFrame.value?.jpeg?.let { scheduleLutPreviewStrip(it, force = true) }
     }
 
@@ -956,6 +1179,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _lutCaptureState.value.importedLuts.firstOrNull { it.label == label }
             ?.thumbnail?.let(::scheduleBitmapRecycle)
         _lutCaptureState.value = _lutCaptureState.value.removeImported(label)
+        persistLiveLutState()
         viewModelScope.launch(Dispatchers.IO) {
             val encoded = Base64.encodeToString(label.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
             getApplication<Application>().getDir(IMPORTED_LUT_DIRECTORY, 0)
@@ -966,6 +1190,32 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setBakeLutIntoPhotos(enabled: Boolean) {
         _lutCaptureState.value = _lutCaptureState.value.copy(bakeIntoPhotos = enabled)
+        persistLiveLutState()
+    }
+
+    private fun restoredPresetLutState(): LutCaptureState {
+        val savedPreset = preferences.getString(LUT_SELECTION_NAME, null)
+            ?.takeIf { preferences.getString(LUT_SELECTION_TYPE, LUT_TYPE_PRESET) == LUT_TYPE_PRESET }
+            ?.let { name -> LutPreset.entries.firstOrNull { it.name == name } }
+            ?: LutPreset.Neutral
+        val intensity = preferences.getFloat(LUT_SELECTION_INTENSITY, 1f).coerceIn(0f, 1f)
+        return LutCaptureState(
+            preset = savedPreset,
+            presetIntensities = LutPreset.entries.associateWith {
+                if (it == savedPreset) intensity else 1f
+            },
+            bakeIntoPhotos = preferences.getBoolean(LUT_BAKE_INTO_PHOTOS, false),
+        )
+    }
+
+    private fun persistLiveLutState() {
+        val state = _lutCaptureState.value
+        preferences.edit()
+            .putString(LUT_SELECTION_TYPE, if (state.importedSelected) LUT_TYPE_IMPORTED else LUT_TYPE_PRESET)
+            .putString(LUT_SELECTION_NAME, state.selectedImportedLabel ?: state.preset.name)
+            .putFloat(LUT_SELECTION_INTENSITY, state.intensity)
+            .putBoolean(LUT_BAKE_INTO_PHOTOS, state.bakeIntoPhotos)
+            .apply()
     }
 
     fun saveLutCopy() {
@@ -973,22 +1223,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (
             editor.isProcessing || _isBusy.value ||
             (editor.selectedImportedLabel == null && editor.preset == LutPreset.Neutral && editor.exposure == 0f &&
-                editor.contrast == 0f && editor.saturation == 0f)
+                editor.contrast == 0f && editor.saturation == 0f &&
+                !editor.denoiseEnabled && !editor.sharpenEnabled)
         ) return
         lutJob?.cancel()
         _isBusy.value = true
         publishLutEditor(editor.copy(isProcessing = true))
         lutJob = viewModelScope.launch {
             try {
-                val source = readAssetBytes(editor.item.source)
+                val source = readEditorSourceBytes(editor.item)
                 val processed = withContext(Dispatchers.Default) {
                     val imported = editor.importedLuts.firstOrNull { it.label == editor.selectedImportedLabel }
                     if (imported != null) imageProcessor.applyEditsToJpeg(
                         source, imported.cube, editor.intensity,
                         editor.exposure, editor.contrast, editor.saturation,
+                        editor.effectiveDenoiseStrength, editor.effectiveSharpenStrength, editor.denoiseModel,
                     ) else imageProcessor.applyEditsToJpeg(
                         source, editor.preset, editor.intensity,
                         editor.exposure, editor.contrast, editor.saturation,
+                        editor.effectiveDenoiseStrength, editor.effectiveSharpenStrength, editor.denoiseModel,
                     )
                 }
                 val saved = repository.saveProcessedJpeg(
@@ -1013,6 +1266,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun closeLutEditor() {
         lutJob?.cancel()
+        editorPreviewRequests?.close()
+        editorPreviewRequests = null
+        editorPreviewJob?.cancel()
+        editorPreviewGeneration++
+        editorPreviewBase?.let(::scheduleBitmapRecycle)
+        editorPreviewBase = null
         publishLutEditor(null)
     }
 
@@ -1082,14 +1341,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 suspend fun acceptBatch(batch: ContinuousBatchResult) {
                     batch.importedCaptures.forEach { capture ->
                         if (frameTracker.disposition() == LiveNdFrameDisposition.Extra) {
-                            appendSavedAsset(capture, CaptureAssetKind.Photo, "ND extra")
+                            repository.discardSavedCapture(capture.uri)
                             return@forEach
                         }
                         val preview = try {
                             withContext(Dispatchers.Default) { requireNotNull(processor).add(capture.jpeg) }
                         } catch (error: FrameAlignmentException) {
                             frameTracker.recordRejected()
-                            appendSavedAsset(capture, CaptureAssetKind.Photo, "ND rejected")
+                            repository.discardSavedCapture(capture.uri)
                             _message.value = UiMessage(
                                 error.readableMessage("This burst frame could not be aligned"),
                                 true,
@@ -1099,11 +1358,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         frameTracker.recordAccepted()
                         frames = frameTracker.acceptedFrames
                         if (metadataSource == null) metadataSource = capture.jpeg.copyOf()
-                        burstSourceIds += appendSavedAsset(
-                            capture,
-                            CaptureAssetKind.SourceFrame,
-                            "ND $frames",
-                        ).id
+                        burstSourceIds += appendPrivateSource(capture, "ND $frames").id
                         publishCaptureSession(_captureSession.value.copy(
                             frameCount = frames,
                             preview = preview,
@@ -1393,12 +1648,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 while (frames < maximum && attempts < maximumAttempts && !sessionStopRequested) {
                     attempts++
                     val capture = repository.downloadCapture(_automaticPostviewPreference.value)
-                    val savedSource = repository.saveCapture(capture, "SONY_SOURCE")
-                    val source = appendSavedAsset(
-                        savedSource,
-                        CaptureAssetKind.SourceFrame,
-                        "${mode.label} source ${frames + 1}",
-                    )
+                    val source = appendSourceAsset(capture, mode, frames + 1)
                     sourceIds += source.id
                     val preview = try {
                         withContext(Dispatchers.Default) { processor.addFrame(capture.jpeg) }
@@ -1604,8 +1854,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         runCommand {
             val capture = repository.downloadCapture(_automaticPostviewPreference.value)
             val frameNumber = processor.frameCount + 1
-            val savedSource = repository.saveCapture(capture, "SONY_PANO_SOURCE")
-            val source = appendSavedAsset(savedSource, CaptureAssetKind.SourceFrame, "Pano source $frameNumber")
+            val source = appendSourceAsset(capture, CaptureMode.Panorama, frameNumber)
             try {
                 val preview = withContext(Dispatchers.Default) {
                     synchronized(panoramaProcessorLock) { processor.add(capture.jpeg) }
@@ -1710,11 +1959,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             ))
             pendingPreview = null
             try {
-                val sourceItem = appendSavedAsset(
-                    capture = capture,
-                    kind = CaptureAssetKind.SourceFrame,
-                    title = "Pano $frameNumber",
-                )
+                val sourceItem = appendPrivateSource(capture, "Pano $frameNumber")
                 panoramaSourceItems += sourceItem
                 _message.value = UiMessage("Camera shutter frame $frameNumber added to panorama")
             } catch (error: Throwable) {
@@ -1842,6 +2087,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun retryLiveView() {
         if (!isForeground || liveViewJob?.isActive == true) return
         if (liveViewRestartJob?.isActive == true) return
+        liveViewTimeoutJob?.cancel()
         liveViewRestartJob = viewModelScope.launch {
             liveViewStartupFailures = 0
             liveViewJob?.cancel()
@@ -1906,8 +2152,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
         if (isForeground) return
         isForeground = true
+        suppressAutoReconnect = false
         if (isDisconnecting) return
         if (sessionJob?.isActive == true) return
+        if (connection.value !is ConnectionState.Ready) {
+            _pairedCameras.value.filter { it.autoConnect }.takeIf { it.isNotEmpty() }?.let {
+                scheduleAutoReconnect(immediate = true)
+                return
+            }
+        }
         val previous = lifecycleJob
         lifecycleJob = viewModelScope.launch {
             previous?.cancelAndJoin()
@@ -1933,10 +2186,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun onBackground() {
         if (!isForeground) return
         isForeground = false
+        autoReconnectJob?.cancel()
         pauseOriginalImportForCameraWork()
         val previous = lifecycleJob
         previous?.cancel()
         liveViewRestartJob?.cancel()
+        liveViewTimeoutJob?.cancel()
         continuousBurstJob?.cancel()
         zoomTargetJob?.cancel()
         lutPreviewJob?.cancel()
@@ -1972,6 +2227,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         liveViewJob = streamingJob
+        scheduleLiveViewTimeout()
         liveViewRestartJob?.cancel()
         liveViewRestartJob = viewModelScope.launch {
             delay(LIVEVIEW_FIRST_FRAME_TIMEOUT_MILLIS)
@@ -1991,6 +2247,45 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     _message.value = UiMessage("Live view did not produce frames; tap Start live view to retry", true)
                 }
             }
+        }
+    }
+
+    private fun scheduleLiveViewTimeout() {
+        liveViewTimeoutJob?.cancel()
+        val minutes = _liveViewTimeoutMinutes.value
+        if (minutes <= 0 || liveViewJob?.isActive != true) return
+        liveViewTimeoutJob = viewModelScope.launch {
+            delay(minutes * MILLIS_PER_MINUTE)
+            liveViewRestartJob?.cancelAndJoin()
+            liveViewJob?.cancel()
+            repository.cancelLiveViewIo()
+            liveViewJob?.join()
+            liveViewJob = null
+            _message.value = UiMessage("Live view stopped after $minutes ${if (minutes == 1) "minute" else "minutes"} to save battery")
+        }
+    }
+
+    private fun scheduleAutoReconnect(immediate: Boolean = false) {
+        if (autoReconnectJob?.isActive == true || connectionJob?.isActive == true) return
+        val candidates = _pairedCameras.value.filter { it.autoConnect }
+        if (candidates.isEmpty()) return
+        autoReconnectJob = viewModelScope.launch {
+            if (!immediate) delay(AUTO_RECONNECT_DELAY_MILLIS)
+            while (isForeground && !isDisconnecting && !suppressAutoReconnect) {
+                val eligible = eligibleAutoConnectCameras(candidates)
+                if (eligible.isNotEmpty()) {
+                    connectToCameras(eligible)
+                    return@launch
+                }
+                delay(AUTO_RECONNECT_DELAY_MILLIS)
+            }
+        }
+    }
+
+    private suspend fun eligibleAutoConnectCameras(cameras: List<PairedCamera>): List<PairedCamera> {
+        val currentSsid = repository.awaitCurrentWifiSsid()
+        return cameras.filter { camera ->
+            camera.canRequestWifi || camera.ssid.isNotBlank() && camera.ssid == currentSsid
         }
     }
 
@@ -2018,6 +2313,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val workspaceItem = workspace.writeJpeg(capture.jpeg)
         val thumbnail = withContext(Dispatchers.Default) { imageProcessor.thumbnail(capture.jpeg) }
         val item = FilmstripItem(
+            id = workspaceItem.name,
             kind = CaptureAssetKind.SourceFrame,
             title = when (mode) {
                 CaptureMode.LiveNd -> "ND $frameNumber"
@@ -2029,6 +2325,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             thumbnail = thumbnail,
         )
         appendFilmstrip(item)
+        return item
+    }
+
+    private suspend fun appendPrivateSource(capture: SavedCapture, title: String): FilmstripItem {
+        val workspaceItem = workspace.writeJpeg(capture.jpeg)
+        val thumbnail = withContext(Dispatchers.Default) { imageProcessor.thumbnail(capture.jpeg) }
+        val item = FilmstripItem(
+            id = workspaceItem.name,
+            kind = CaptureAssetKind.SourceFrame,
+            title = title,
+            source = CaptureAssetSource.Workspace(workspaceItem),
+            thumbnail = thumbnail,
+        )
+        appendFilmstrip(item)
+        repository.discardSavedCapture(capture.uri)
         return item
     }
 
@@ -2094,6 +2405,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 if (orphaned.isNotEmpty()) {
                     _filmstrip.value = _filmstrip.value.filterNot { it in orphaned }
                     orphaned.map(FilmstripItem::thumbnail).distinct().forEach(::scheduleBitmapRecycle)
+                }
+            }
+            if (relatedSourceIds.isNotEmpty()) {
+                val privateSources = _filmstrip.value
+                    .filter { it.id in relatedSourceIds }
+                    .mapNotNull { (it.source as? CaptureAssetSource.Workspace)?.item }
+                if (privateSources.isNotEmpty()) {
+                    workspace.associate(capture.uri.toString(), privateSources)
                 }
             }
             appendFilmstrip(item)
@@ -2470,6 +2789,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
+    private suspend fun readEditorSourceBytes(item: FilmstripItem): ByteArray {
+        val media = item.source as? CaptureAssetSource.MediaStore
+        return media?.let { repository.readEditingOriginal(it.uri) } ?: readAssetBytes(item.source)
+    }
+
     private suspend fun readMediaStoreBytes(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
         getApplication<Application>().contentResolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Android could not open this image" }.readBytes()
@@ -2478,6 +2802,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun pauseLiveViewForSession() {
         liveViewRestartJob?.cancelAndJoin()
+        liveViewTimeoutJob?.cancelAndJoin()
         liveViewJob?.cancel()
         repository.cancelLiveViewIo()
         liveViewJob?.join()
@@ -2516,6 +2841,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         commandJob?.cancel()
         sessionJob?.cancel()
         lutJob?.cancel()
+        editorPreviewRequests?.close()
+        editorPreviewRequests = null
+        editorPreviewJob?.cancel()
+        editorPreviewBase?.takeUnless(Bitmap::isRecycled)?.recycle()
+        editorPreviewBase = null
         lutDerivativeJobs.values.forEach(Job::cancel)
         lutDerivativeJobs.clear()
         physicalCaptureJob?.cancel()
@@ -2524,16 +2854,29 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         activeOriginalImportJob?.cancel()
         pollJob?.cancel()
         liveViewRestartJob?.cancel()
+        liveViewTimeoutJob?.cancel()
+        autoReconnectJob?.cancel()
         liveViewJob?.cancel()
         lifecycleJob?.cancel()
         closeComputationalSessions()
         repository.cancelActiveIo()
         repository.close()
+        rawRefineryProcessor.close()
         super.onCleared()
     }
 
     private companion object {
         const val DEFAULT_LIVE_ND_FRAMES = 4
+        const val DEFAULT_AUTO_DENOISE_ISO = 1600
+        const val AUTO_DENOISE_STRENGTH = 0.6f
+        const val MILLIS_PER_MINUTE = 60_000L
+        const val AUTO_RECONNECT_DELAY_MILLIS = 5_000L
+        const val LUT_SELECTION_TYPE = "live_lut_selection_type"
+        const val LUT_SELECTION_NAME = "live_lut_selection_name"
+        const val LUT_SELECTION_INTENSITY = "live_lut_selection_intensity"
+        const val LUT_BAKE_INTO_PHOTOS = "live_lut_bake_into_photos"
+        const val LUT_TYPE_PRESET = "preset"
+        const val LUT_TYPE_IMPORTED = "imported"
         const val ZOOM_TARGET_TOLERANCE = 1
         const val ZOOM_TARGET_TIMEOUT_MILLIS = 20_000L
         const val ZOOM_TARGET_MAX_STEPS = 100
@@ -2552,6 +2895,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         const val LUT_LIVE_PREVIEW_INTERVAL_MILLIS = 250L
         const val LUT_PREVIEW_REFRESH_MILLIS = 2_000L
         const val PREVIEW_RECYCLE_DELAY_MILLIS = 1_000L
+        const val EDITOR_EFFECT_DEBOUNCE_MILLIS = 180L
         const val POSTVIEW_RESTORE_TIMEOUT_MILLIS = 4_000L
         const val LIVEVIEW_RESUME_TIMEOUT_MILLIS = 8_000L
         const val LIVEVIEW_FIRST_FRAME_TIMEOUT_MILLIS = 8_000L
@@ -2572,6 +2916,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         const val ORIGINAL_IMPORT_PAUSE_POLL_MILLIS = 100L
         val LIVE_ND_FRAME_OPTIONS = setOf(2, 4, 8, 16, 32)
     }
+}
+
+internal fun uniqueImportedLutLabel(name: String, existing: Set<String>): String {
+    val base = name.replace('\\', '/').substringAfterLast('/').substringBeforeLast('.').ifBlank { "Imported LUT" }
+    if (base !in existing) return base
+    var suffix = 2
+    while ("$base ($suffix)" in existing) suffix++
+    return "$base ($suffix)"
 }
 
 private fun captureKindForSavedName(name: String): CaptureAssetKind = when {

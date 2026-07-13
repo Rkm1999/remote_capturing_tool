@@ -72,6 +72,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -103,11 +104,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlin.math.roundToInt
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.ryu.sonyremote.model.CameraCapabilities
@@ -126,6 +129,7 @@ fun CameraRemoteApp(
     viewModel: CameraViewModel,
     onOpenWifi: () -> Unit,
     onFindCamera: () -> Unit,
+    onPairCamera: (String, String, Boolean) -> Unit,
     onOpenAppSettings: () -> Unit,
 ) {
     val connection by viewModel.connection.collectAsStateWithLifecycle()
@@ -137,6 +141,7 @@ fun CameraRemoteApp(
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
     val permissionBlocked by viewModel.permissionBlocked.collectAsStateWithLifecycle()
+    val pairedCameras by viewModel.pairedCameras.collectAsStateWithLifecycle()
     val captureMode by viewModel.captureMode.collectAsStateWithLifecycle()
     val liveNdFrames by viewModel.liveNdFrames.collectAsStateWithLifecycle()
     val liveNdStrategy by viewModel.liveNdStrategy.collectAsStateWithLifecycle()
@@ -149,6 +154,9 @@ fun CameraRemoteApp(
     val geotaggingEnabled by viewModel.geotaggingEnabled.collectAsStateWithLifecycle()
     val automaticPostviewPreference by viewModel.automaticPostviewPreference.collectAsStateWithLifecycle()
     val outputImageFormat by viewModel.outputImageFormat.collectAsStateWithLifecycle()
+    val autoDenoiseMode by viewModel.autoDenoiseMode.collectAsStateWithLifecycle()
+    val autoDenoiseIsoThreshold by viewModel.autoDenoiseIsoThreshold.collectAsStateWithLifecycle()
+    val liveViewTimeoutMinutes by viewModel.liveViewTimeoutMinutes.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -284,6 +292,11 @@ fun CameraRemoteApp(
                 error = null,
                 isBusy = isBusy,
                 permissionBlocked = permissionBlocked,
+                pairedCameras = pairedCameras,
+                onPairCamera = onPairCamera,
+                onConnectPaired = viewModel::connectPairedCamera,
+                onSetAutoConnect = viewModel::setPairedCameraAutoConnect,
+                onForgetPaired = viewModel::forgetPairedCamera,
                 onOpenWifi = onOpenWifi,
                 onFindCamera = onFindCamera,
                 onOpenAppSettings = onOpenAppSettings,
@@ -295,6 +308,11 @@ fun CameraRemoteApp(
                 error = state.message,
                 isBusy = isBusy,
                 permissionBlocked = permissionBlocked,
+                pairedCameras = pairedCameras,
+                onPairCamera = onPairCamera,
+                onConnectPaired = viewModel::connectPairedCamera,
+                onSetAutoConnect = viewModel::setPairedCameraAutoConnect,
+                onForgetPaired = viewModel::forgetPairedCamera,
                 onOpenWifi = onOpenWifi,
                 onFindCamera = onFindCamera,
                 onOpenAppSettings = onOpenAppSettings,
@@ -333,6 +351,12 @@ fun CameraRemoteApp(
             onSetPostviewPreference = viewModel::setAutomaticPostviewPreference,
             outputImageFormat = outputImageFormat,
             onSetOutputImageFormat = viewModel::setOutputImageFormat,
+            autoDenoiseMode = autoDenoiseMode,
+            autoDenoiseIsoThreshold = autoDenoiseIsoThreshold,
+            onSetAutoDenoiseMode = viewModel::setAutoDenoiseMode,
+            onSetAutoDenoiseIsoThreshold = viewModel::setAutoDenoiseIsoThreshold,
+            liveViewTimeoutMinutes = liveViewTimeoutMinutes,
+            onSetLiveViewTimeoutMinutes = viewModel::setLiveViewTimeoutMinutes,
             onSetGeotagging = { enabled ->
                 if (!enabled) {
                     viewModel.setGeotaggingEnabled(false)
@@ -372,6 +396,10 @@ fun CameraRemoteApp(
             onSelectImported = viewModel::selectEditorImportedLut,
             onSetIntensity = viewModel::setLutIntensity,
             onSetBasicEdits = viewModel::setBasicEdits,
+            onSetDenoiseEnabled = viewModel::setEditorDenoiseEnabled,
+            onSetDenoiseStrength = viewModel::setEditorDenoiseStrength,
+            onSetSharpenEnabled = viewModel::setEditorSharpenEnabled,
+            onSetSharpenStrength = viewModel::setEditorSharpenStrength,
             onSave = viewModel::saveLutCopy,
             onDismiss = viewModel::closeLutEditor,
         )
@@ -381,6 +409,7 @@ fun CameraRemoteApp(
             items = filmstrip,
             enabled = true,
             onOpenLut = viewModel::openLutEditor,
+            onLoadDetail = viewModel::loadGalleryDetail,
             onImportOriginal = viewModel::requestOriginalImport,
             onCancelOriginal = viewModel::cancelOriginalImport,
             onDismiss = { showHistory = false },
@@ -394,11 +423,17 @@ private fun SetupScreen(
     error: String?,
     isBusy: Boolean,
     permissionBlocked: Boolean,
+    pairedCameras: List<com.ryu.sonyremote.network.PairedCamera>,
+    onPairCamera: (String, String, Boolean) -> Unit,
+    onConnectPaired: (String) -> Unit,
+    onSetAutoConnect: (String, Boolean) -> Unit,
+    onForgetPaired: (String) -> Unit,
     onOpenWifi: () -> Unit,
     onFindCamera: () -> Unit,
     onOpenAppSettings: () -> Unit,
     onOpenGallery: () -> Unit,
 ) {
+    var showPairDialog by remember { mutableStateOf(false) }
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -421,6 +456,62 @@ private fun SetupScreen(
             Icon(Icons.Default.PhotoLibrary, contentDescription = null)
             Spacer(Modifier.width(10.dp))
             Text("Gallery")
+        }
+
+        if (pairedCameras.isNotEmpty()) {
+            Text("Paired cameras", style = MaterialTheme.typography.titleMedium)
+            pairedCameras.forEach { camera ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.outlineVariant,
+                    ),
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(camera.displayName, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    when {
+                                        camera.canRequestWifi && camera.autoConnect -> "Can join Wi-Fi automatically"
+                                        camera.autoConnect -> "Starts when Android joins this Wi-Fi"
+                                        else -> "Manual connection"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Switch(
+                                checked = camera.autoConnect,
+                                onCheckedChange = { onSetAutoConnect(camera.id, it) },
+                                enabled = !isBusy,
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { onConnectPaired(camera.id) },
+                                enabled = !isBusy,
+                                modifier = Modifier.weight(1f),
+                            ) { Text("Connect") }
+                            IconButton(
+                                onClick = { onForgetPaired(camera.id) },
+                                enabled = !isBusy,
+                            ) { Icon(Icons.Default.Delete, contentDescription = "Forget ${camera.displayName}") }
+                        }
+                    }
+                }
+            }
+        }
+        OutlinedButton(
+            onClick = { showPairDialog = true },
+            enabled = !isBusy,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null)
+            Spacer(Modifier.width(10.dp))
+            Text("Pair camera Wi-Fi")
         }
 
         if (error != null) {
@@ -478,6 +569,70 @@ private fun SetupScreen(
             isError = false,
         )
     }
+
+    if (showPairDialog) {
+        PairCameraDialog(
+            onPair = { ssid, password, autoConnect ->
+                showPairDialog = false
+                onPairCamera(ssid, password, autoConnect)
+            },
+            onDismiss = { showPairDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun PairCameraDialog(
+    onPair: (String, String, Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var ssid by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var autoConnect by remember { mutableStateOf(true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pair camera Wi-Fi") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = ssid,
+                    onValueChange = { ssid = it },
+                    label = { Text("Camera Wi-Fi name") },
+                    placeholder = { Text("DIRECT-xxxx") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Wi-Fi password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("Connect automatically")
+                    Switch(checked = autoConnect, onCheckedChange = { autoConnect = it })
+                }
+                Text(
+                    "Android asks for approval the first time this camera is connected.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onPair(ssid.trim(), password, autoConnect) },
+                enabled = ssid.isNotBlank() && password.length >= 8,
+            ) { Text("Pair and connect") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -490,6 +645,12 @@ private fun CameraSettingsDialog(
     onSetPostviewPreference: (com.ryu.sonyremote.model.PostviewSizePreference) -> Unit,
     outputImageFormat: com.ryu.sonyremote.model.OutputImageFormat,
     onSetOutputImageFormat: (com.ryu.sonyremote.model.OutputImageFormat) -> Unit,
+    autoDenoiseMode: AutoDenoiseMode,
+    autoDenoiseIsoThreshold: Int,
+    onSetAutoDenoiseMode: (AutoDenoiseMode) -> Unit,
+    onSetAutoDenoiseIsoThreshold: (Int) -> Unit,
+    liveViewTimeoutMinutes: Int,
+    onSetLiveViewTimeoutMinutes: (Int) -> Unit,
     onSetLiveviewSize: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -497,7 +658,10 @@ private fun CameraSettingsDialog(
         onDismissRequest = onDismiss,
         title = { Text("Settings") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Text("Photo download", style = MaterialTheme.typography.titleSmall)
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                     val choices = listOf(
@@ -535,6 +699,87 @@ private fun CameraSettingsDialog(
                         )
                     }
                 }
+                Text("Automatic denoise", style = MaterialTheme.typography.titleSmall)
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    AutoDenoiseMode.entries.forEachIndexed { index, mode ->
+                        SegmentedButton(
+                            selected = autoDenoiseMode == mode,
+                            onClick = { onSetAutoDenoiseMode(mode) },
+                            enabled = enabled,
+                            shape = SegmentedButtonDefaults.itemShape(index, AutoDenoiseMode.entries.size),
+                            label = { Text(mode.label) },
+                        )
+                    }
+                }
+                if (autoDenoiseMode == AutoDenoiseMode.IsoThreshold) {
+                    val isoChoices = listOf(400, 800, 1600, 3200, 6400, 12800, 25600)
+                    val selectedIndex = isoChoices.indexOf(autoDenoiseIsoThreshold)
+                        .takeIf { it >= 0 } ?: 2
+                    Text(
+                        "Run at ISO $autoDenoiseIsoThreshold and above",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Slider(
+                        value = selectedIndex.toFloat(),
+                        onValueChange = { index ->
+                            onSetAutoDenoiseIsoThreshold(isoChoices[index.roundToInt()])
+                        },
+                        valueRange = 0f..isoChoices.lastIndex.toFloat(),
+                        steps = isoChoices.size - 2,
+                        enabled = enabled,
+                    )
+                }
+                if (autoDenoiseMode != AutoDenoiseMode.Off) {
+                    Text(
+                        "RawRefinery Light runs at full resolution. The untouched original remains available in Edit.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text("Live view battery saver", style = MaterialTheme.typography.titleSmall)
+                var timeoutMenuOpen by remember { mutableStateOf(false) }
+                val timeoutChoices = listOf(
+                    0 to "Never turn off",
+                    1 to "After 1 minute",
+                    3 to "After 3 minutes",
+                    5 to "After 5 minutes",
+                    10 to "After 10 minutes",
+                    30 to "After 30 minutes",
+                )
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { timeoutMenuOpen = true },
+                        enabled = enabled,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(timeoutChoices.firstOrNull { it.first == liveViewTimeoutMinutes }?.second ?: "Never turn off")
+                        Spacer(Modifier.weight(1f))
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = null)
+                    }
+                    DropdownMenu(
+                        expanded = timeoutMenuOpen,
+                        onDismissRequest = { timeoutMenuOpen = false },
+                    ) {
+                        timeoutChoices.forEach { (minutes, label) ->
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    onSetLiveViewTimeoutMinutes(minutes)
+                                    timeoutMenuOpen = false
+                                },
+                                leadingIcon = if (minutes == liveViewTimeoutMinutes) {
+                                    { Icon(Icons.Default.Check, contentDescription = null) }
+                                } else null,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    "Stops live view without disconnecting the camera. Tap Start live view to resume.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Text("Live view quality", style = MaterialTheme.typography.titleSmall)
                 if (capabilities.availableLiveviewSizes.isEmpty()) {
                     Text(
@@ -689,6 +934,12 @@ private fun CameraControlScreen(
         capabilities.settings[com.ryu.sonyremote.model.CameraSettingId.ShutterSpeed]?.currentWireValue,
         liveNdFrames,
     )
+    val activeLutLabel = if (lutState.isOriginal) {
+        "Original"
+    } else {
+        val name = lutState.importedLut?.label ?: lutState.preset.label
+        "$name ${(lutState.intensity * 100).roundToInt()}%"
+    }
     val liveStatus = when {
         showProcessedPreview && session.mode == CaptureMode.LiveNd -> {
             "ND ${session.frameCount}/${session.targetFrames ?: liveNdFrames}" +
@@ -707,6 +958,7 @@ private fun CameraControlScreen(
             pipPreview = pipPreview,
             isStreaming = isStreaming || session.isActive,
             statusLabel = liveStatus,
+            lutLabel = activeLutLabel,
             loadingText = if (session.isActive) "Capturing frame" else "Starting live view",
             isImporting = isPhysicalShutterTransferActive,
             processingProgress = session.processingProgress,
@@ -897,6 +1149,7 @@ private fun LiveView(
     pipPreview: Bitmap?,
     isStreaming: Boolean,
     statusLabel: String,
+    lutLabel: String,
     loadingText: String,
     isImporting: Boolean,
     processingProgress: Float?,
@@ -963,6 +1216,20 @@ private fun LiveView(
                     Text(statusLabel, color = Color.White, style = MaterialTheme.typography.labelSmall)
                 }
             }
+        }
+        Surface(
+            color = Color.Black.copy(alpha = 0.68f),
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
+        ) {
+            Text(
+                "LUT: $lutLabel",
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+            )
         }
         if (isImporting || processingProgress != null) {
             Surface(
@@ -1627,8 +1894,8 @@ private fun LutCaptureControls(
                         .width(76.dp)
                         .height(62.dp)
                         .border(
-                            width = if (state.preset == preview.preset) 2.dp else 0.dp,
-                            color = if (state.preset == preview.preset) {
+                            width = if (!state.importedSelected && state.preset == preview.preset) 2.dp else 0.dp,
+                            color = if (!state.importedSelected && state.preset == preview.preset) {
                                 MaterialTheme.colorScheme.primary
                             } else {
                                 Color.Transparent
@@ -1745,7 +2012,7 @@ private fun LutSettingsDialog(
                     }
                 }
                 state.visiblePresets.filterNot { it == LutPreset.Neutral }.forEach { preset ->
-                    val selected = state.preset == preset
+                    val selected = !state.importedSelected && state.preset == preset
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         FilterChip(
                             selected = selected,
@@ -1935,6 +2202,7 @@ private fun CaptureHistoryDialog(
     items: List<FilmstripItem>,
     enabled: Boolean,
     onOpenLut: (FilmstripItem) -> Unit,
+    onLoadDetail: suspend (FilmstripItem) -> Bitmap,
     onImportOriginal: (String) -> Unit,
     onCancelOriginal: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -1947,15 +2215,12 @@ private fun CaptureHistoryDialog(
     } else {
         items.filter { it.id in sourceIds }
     }
-    val context = LocalContext.current
     var detailBitmap by remember { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(selected?.id) {
         detailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
         detailBitmap = null
-        val uri = (selected?.source as? CaptureAssetSource.MediaStore)?.uri ?: return@LaunchedEffect
-        detailBitmap = withContext(Dispatchers.IO) {
-            context.contentResolver.loadThumbnail(uri, android.util.Size(2_048, 2_048), null)
-        }
+        val item = selected ?: return@LaunchedEffect
+        detailBitmap = runCatching { onLoadDetail(item) }.getOrNull()
     }
     DisposableEffect(Unit) {
         onDispose { detailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle() }
@@ -2075,9 +2340,14 @@ private fun LutEditorDialog(
     onSelectImported: (String) -> Unit,
     onSetIntensity: (Float) -> Unit,
     onSetBasicEdits: (Float, Float, Float) -> Unit,
+    onSetDenoiseEnabled: (Boolean) -> Unit,
+    onSetDenoiseStrength: (Float) -> Unit,
+    onSetSharpenEnabled: (Boolean) -> Unit,
+    onSetSharpenStrength: (Float) -> Unit,
     onSave: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var activeRawTool by remember(state.item.id) { mutableStateOf<String?>(null) }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -2148,6 +2418,42 @@ private fun LutEditorDialog(
                 BasicEditSlider("Saturation", state.saturation) {
                     onSetBasicEdits(state.exposure, state.contrast, it)
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(
+                        selected = state.denoiseEnabled,
+                        onClick = {
+                            val enabled = !state.denoiseEnabled
+                            activeRawTool = "denoise".takeIf { enabled }
+                            onSetDenoiseEnabled(enabled)
+                        },
+                        label = { Text("Denoise") },
+                    )
+                    FilterChip(
+                        selected = state.sharpenEnabled,
+                        onClick = {
+                            val enabled = !state.sharpenEnabled
+                            activeRawTool = "sharpen".takeIf { enabled }
+                            onSetSharpenEnabled(enabled)
+                        },
+                        label = { Text("Deep Sharpen") },
+                    )
+                }
+                when {
+                    activeRawTool == "denoise" && state.denoiseEnabled -> EffectStrengthSlider(
+                        label = "Denoise",
+                        value = state.denoiseStrength,
+                        onValueChange = onSetDenoiseStrength,
+                    )
+                    activeRawTool == "sharpen" && state.sharpenEnabled -> EffectStrengthSlider(
+                        label = "Sharpen",
+                        value = state.sharpenStrength,
+                        onValueChange = onSetSharpenStrength,
+                    )
+                }
                 LutEditorFilmstrip(state, onSelectPreset, onSelectImported)
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
@@ -2160,7 +2466,7 @@ private fun LutEditorDialog(
                         onClick = onSave,
                         enabled = (
                             state.selectedImportedLabel != null || state.preset != LutPreset.Neutral || state.exposure != 0f ||
-                                state.contrast != 0f || state.saturation != 0f
+                                state.contrast != 0f || state.saturation != 0f || state.denoiseEnabled || state.sharpenEnabled
                             ) && !state.isProcessing,
                     ) {
                         Icon(Icons.Default.Palette, contentDescription = null)
@@ -2170,6 +2476,18 @@ private fun LutEditorDialog(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun EffectStrengthSlider(label: String, value: Float, onValueChange: (Float) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(76.dp))
+        Slider(value = value, onValueChange = onValueChange, modifier = Modifier.weight(1f))
+        Text("${(value * 100).toInt()}%", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(42.dp))
     }
 }
 

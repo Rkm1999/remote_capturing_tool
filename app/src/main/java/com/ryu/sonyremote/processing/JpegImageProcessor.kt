@@ -11,7 +11,58 @@ import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
-class JpegImageProcessor {
+class JpegImageProcessor(
+    private val rawRefineryProcessor: RawRefineryProcessor? = null,
+) {
+    fun photographicSensitivity(jpeg: ByteArray): Int? = runCatching {
+        ExifInterface(ByteArrayInputStream(jpeg))
+            .getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+            ?.substringBefore(',')
+            ?.trim()
+            ?.toIntOrNull()
+    }.getOrNull()
+
+    fun prepareEditorPreview(
+        jpeg: ByteArray,
+        denoiseStrength: Float = 0f,
+        sharpenStrength: Float = 0f,
+        denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
+    ): Bitmap = applyRawEffects(
+        decode(jpeg, maxEdge = EDITOR_PREVIEW_EDGE, mutable = true),
+        jpeg,
+        denoiseStrength,
+        sharpenStrength,
+        denoiseModel,
+    )
+
+    fun renderEditorPreview(
+        base: Bitmap,
+        preset: LutPreset,
+        intensity: Float,
+        exposure: Float,
+        contrast: Float,
+        saturation: Float,
+    ): Bitmap = applyBasicEdits(
+        applyLut(base.copy(Bitmap.Config.ARGB_8888, true), preset, intensity),
+        exposure,
+        contrast,
+        saturation,
+    )
+
+    fun renderEditorPreview(
+        base: Bitmap,
+        lut: CubeLut,
+        intensity: Float,
+        exposure: Float,
+        contrast: Float,
+        saturation: Float,
+    ): Bitmap = applyBasicEdits(
+        applyLut(base.copy(Bitmap.Config.ARGB_8888, true), lut, intensity),
+        exposure,
+        contrast,
+        saturation,
+    )
+
     fun editPreview(
         jpeg: ByteArray,
         preset: LutPreset,
@@ -19,8 +70,11 @@ class JpegImageProcessor {
         exposure: Float,
         contrast: Float,
         saturation: Float,
+        denoiseStrength: Float = 0f,
+        sharpenStrength: Float = 0f,
+        denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
     ): Bitmap = applyBasicEdits(
-        applyLut(decode(jpeg, maxEdge = PREVIEW_EDGE, mutable = true), preset, intensity),
+        applyLut(applyRawEffects(decode(jpeg, maxEdge = previewEdge(denoiseStrength, sharpenStrength), mutable = true), jpeg, denoiseStrength, sharpenStrength, denoiseModel), preset, intensity),
         exposure,
         contrast,
         saturation,
@@ -33,9 +87,12 @@ class JpegImageProcessor {
         exposure: Float,
         contrast: Float,
         saturation: Float,
+        denoiseStrength: Float = 0f,
+        sharpenStrength: Float = 0f,
+        denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
     ): ByteArray {
         val bitmap = applyBasicEdits(
-            applyLut(decode(jpeg, maxEdge = null, mutable = true), preset, intensity),
+            applyLut(applyRawEffects(decode(jpeg, maxEdge = exportEdge(denoiseStrength, sharpenStrength), mutable = true), jpeg, denoiseStrength, sharpenStrength, denoiseModel), preset, intensity),
             exposure,
             contrast,
             saturation,
@@ -46,17 +103,21 @@ class JpegImageProcessor {
     fun editPreview(
         jpeg: ByteArray, lut: CubeLut, intensity: Float,
         exposure: Float, contrast: Float, saturation: Float,
+        denoiseStrength: Float = 0f, sharpenStrength: Float = 0f,
+        denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
     ): Bitmap = applyBasicEdits(
-        applyLut(decode(jpeg, maxEdge = PREVIEW_EDGE, mutable = true), lut, intensity),
+        applyLut(applyRawEffects(decode(jpeg, maxEdge = previewEdge(denoiseStrength, sharpenStrength), mutable = true), jpeg, denoiseStrength, sharpenStrength, denoiseModel), lut, intensity),
         exposure, contrast, saturation,
     )
 
     fun applyEditsToJpeg(
         jpeg: ByteArray, lut: CubeLut, intensity: Float,
         exposure: Float, contrast: Float, saturation: Float,
+        denoiseStrength: Float = 0f, sharpenStrength: Float = 0f,
+        denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
     ): ByteArray {
         val bitmap = applyBasicEdits(
-            applyLut(decode(jpeg, maxEdge = null, mutable = true), lut, intensity),
+            applyLut(applyRawEffects(decode(jpeg, maxEdge = exportEdge(denoiseStrength, sharpenStrength), mutable = true), jpeg, denoiseStrength, sharpenStrength, denoiseModel), lut, intensity),
             exposure, contrast, saturation,
         )
         return try { encode(bitmap, JPEG_QUALITY) } finally { bitmap.recycle() }
@@ -175,6 +236,30 @@ class JpegImageProcessor {
         return oriented
     }
 
+    private fun applyRawEffects(
+        bitmap: Bitmap,
+        jpeg: ByteArray,
+        denoiseStrength: Float,
+        sharpenStrength: Float,
+        denoiseModel: RawRefineryDenoiseModel,
+    ): Bitmap {
+        if (denoiseStrength <= 0f && sharpenStrength <= 0f) return bitmap
+        val processor = checkNotNull(rawRefineryProcessor) { "RawRefinery processing is unavailable" }
+        val iso = runCatching {
+            ExifInterface(ByteArrayInputStream(jpeg)).getAttributeInt(
+                ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+                DEFAULT_MODEL_ISO,
+            )
+        }.getOrDefault(DEFAULT_MODEL_ISO)
+        return processor.apply(bitmap, iso, denoiseStrength, sharpenStrength, denoiseModel)
+    }
+
+    private fun previewEdge(denoiseStrength: Float, sharpenStrength: Float) =
+        if (denoiseStrength > 0f || sharpenStrength > 0f) ML_PREVIEW_EDGE else PREVIEW_EDGE
+
+    private fun exportEdge(denoiseStrength: Float, sharpenStrength: Float): Int? =
+        ML_EXPORT_EDGE.takeIf { denoiseStrength > 0f || sharpenStrength > 0f }
+
     private fun applyBasicEdits(
         bitmap: Bitmap,
         exposure: Float,
@@ -212,9 +297,13 @@ class JpegImageProcessor {
     private companion object {
         const val THUMBNAIL_EDGE = 240
         const val PREVIEW_EDGE = 1600
+        const val ML_PREVIEW_EDGE = 960
+        const val EDITOR_PREVIEW_EDGE = 960
+        const val ML_EXPORT_EDGE = Int.MAX_VALUE
         const val LIVE_PREVIEW_EDGE = 960
         const val LUT_THUMBNAIL_EDGE = 200
         const val STRIPE_ROWS = 32
         const val JPEG_QUALITY = 95
+        const val DEFAULT_MODEL_ISO = 800
     }
 }

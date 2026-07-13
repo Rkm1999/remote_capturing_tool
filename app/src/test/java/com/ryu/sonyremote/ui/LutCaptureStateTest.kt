@@ -42,4 +42,14 @@ class LutCaptureStateTest {
         assertEquals(LutPreset.Neutral, removed.preset)
         assertTrue(LutPreset.Neutral in removed.removePreset(LutPreset.Neutral).visiblePresets)
     }
+
+    @Test
+    fun duplicateSharedLutNamesReceiveStableSuffixes() {
+        assertEquals("Look", uniqueImportedLutLabel("folder/Look.cube", emptySet()))
+        assertEquals("Look (2)", uniqueImportedLutLabel("other/Look.cube", setOf("Look")))
+        assertEquals(
+            "Look (4)",
+            uniqueImportedLutLabel("Look.cube", setOf("Look", "Look (2)", "Look (3)")),
+        )
+    }
 }

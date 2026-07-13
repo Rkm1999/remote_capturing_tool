@@ -31,6 +31,7 @@ import com.ryu.sonyremote.protocol.ScalarWebApiClient
 import java.io.IOException
 import java.net.URI
 import java.net.SocketTimeoutException
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -73,6 +74,13 @@ class SonyCameraRepository(context: Context) {
     suspend fun loadSavedGallery(): List<SavedMediaItem> = mediaStore.listSaved()
     suspend fun setLutAttribution(uri: Uri, name: String, strength: Float) =
         mediaStore.setLutAttribution(uri, name, strength)
+    suspend fun readEditingOriginal(uri: Uri): ByteArray? = withContext(Dispatchers.IO) {
+        editingOriginalFile(uri).takeIf { it.isFile }?.readBytes()
+    }
+    suspend fun discardSavedCapture(uri: Uri) {
+        mediaStore.delete(uri)
+        withContext(Dispatchers.IO) { editingOriginalFile(uri).delete() }
+    }
     private val phoneLocation = PhoneLocationProvider(appContext)
     @Volatile private var geotaggingEnabled = false
     private val commandMutex = Mutex()
@@ -137,16 +145,26 @@ class SonyCameraRepository(context: Context) {
     @Volatile private var pendingTransport: NetworkHttpTransport? = null
     @Volatile private var activeLiveViewStream: CameraHttpStream? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var activeWifiSsid: String? = null
 
-    suspend fun connect(): ConnectionState.Ready {
+    fun connectedWifiSsid(): String? = activeWifiSsid
+    fun currentWifiSsid(): String? = networkProvider.currentSsid()
+    suspend fun awaitCurrentWifiSsid(): String? = networkProvider.awaitCurrentSsid()
+
+    suspend fun connect(cameraSsid: String? = null, cameraPassword: String? = null): ConnectionState.Ready {
         disconnect()
         return try {
-            connectAfterDisconnect()
+            val requestedNetwork = if (cameraSsid != null && cameraPassword != null) {
+                networkProvider.requestCameraNetwork(cameraSsid, cameraPassword)
+                    ?: throw fail("Camera Wi-Fi did not become available")
+            } else null
+            connectAfterDisconnect(requestedNetwork)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
             pendingTransport?.cancelActiveRequests()
             pendingTransport = null
             stopNetworkMonitor()
+            networkProvider.releaseRequestedNetwork()
             val active = sessions.clear {
                 _latestFrame.value = null
                 _isStreaming.value = false
@@ -166,11 +184,12 @@ class SonyCameraRepository(context: Context) {
         }
     }
 
-    private suspend fun connectAfterDisconnect(): ConnectionState.Ready {
+    private suspend fun connectAfterDisconnect(requestedNetwork: Network? = null): ConnectionState.Ready {
         DiagnosticLog.record("connect_started")
         _connection.value = ConnectionState.WaitingForWifi
-        val network = networkProvider.awaitWifiNetwork()
+        val network = requestedNetwork ?: networkProvider.awaitWifiNetwork()
             ?: throw fail("Join the camera Wi-Fi network, then try again")
+        activeWifiSsid = networkProvider.ssid(network)
         _connection.value = ConnectionState.Discovering
         val locations = discovery.discover(network)
         DiagnosticLog.record("discovery_finished", mapOf("responses" to locations.size.toString()))
@@ -414,7 +433,16 @@ class SonyCameraRepository(context: Context) {
         val sourceJpeg = capture.jpeg
         val jpeg = JpegValidator.normalize(downloadedImageProcessor(sourceJpeg))
         val savedUri = mediaStore.save(jpeg, prefix, outputImageFormat)
-        if (jpeg !== sourceJpeg) runCatching { mediaStore.copyExif(sourceJpeg, savedUri) }
+        if (!jpeg.contentEquals(sourceJpeg)) {
+            runCatching { mediaStore.copyExif(sourceJpeg, savedUri) }
+            runCatching { saveEditingOriginal(savedUri, sourceJpeg) }
+                .onFailure { error ->
+                    DiagnosticLog.record(
+                        "editing_original_save_failed",
+                        mapOf("error" to error.toUserMessage("unknown")),
+                    )
+                }
+        }
         applyPhoneLocation(savedUri)
         DiagnosticLog.record(
             "photo_saved",
@@ -473,6 +501,20 @@ class SonyCameraRepository(context: Context) {
 
     fun setDownloadedImageProcessor(processor: suspend (ByteArray) -> ByteArray) {
         downloadedImageProcessor = processor
+    }
+
+    private suspend fun saveEditingOriginal(uri: Uri, jpeg: ByteArray) = withContext(Dispatchers.IO) {
+        val destination = editingOriginalFile(uri)
+        val temporary = destination.resolveSibling("${destination.name}.tmp")
+        temporary.writeBytes(JpegValidator.normalize(jpeg))
+        check(temporary.renameTo(destination)) { "Could not retain the editing original" }
+    }
+
+    private fun editingOriginalFile(uri: Uri): java.io.File {
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(uri.toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return appContext.getDir(EDITING_ORIGINAL_DIRECTORY, Context.MODE_PRIVATE).resolve("$key.jpg")
     }
 
     fun setOutputImageFormat(format: OutputImageFormat) {
@@ -861,6 +903,8 @@ class SonyCameraRepository(context: Context) {
         if (_isContinuousShooting.value) runCatching { stopContinuousShooting() }
         sessions.current()?.let(::stopPhysicalShutterMonitor)
         stopNetworkMonitor()
+        networkProvider.releaseRequestedNetwork()
+        activeWifiSsid = null
         cancelActiveIo()
         val active = sessions.clear {
             _latestFrame.value = null
@@ -1337,19 +1381,28 @@ class SonyCameraRepository(context: Context) {
                     "physical_shutter_capture_downloaded",
                     mapOf("bytes" to jpeg.size.toString()),
                 )
-                val saved = SavedCapture(
-                    uri = mediaStore.save(
-                        jpeg,
-                        when {
-                            computationalCaptureImport.get() -> "SONY_SOURCE"
-                            previewFirst -> "SONY_PREVIEW"
-                            else -> "SONY"
-                        },
-                        outputImageFormat,
-                    ).also { uri ->
-                        if (jpeg !== sourceJpeg) runCatching { mediaStore.copyExif(sourceJpeg, uri) }
-                        applyPhoneLocation(uri)
+                val savedUri = mediaStore.save(
+                    jpeg,
+                    when {
+                        computationalCaptureImport.get() -> "SONY_SOURCE"
+                        previewFirst -> "SONY_PREVIEW"
+                        else -> "SONY"
                     },
+                    outputImageFormat,
+                )
+                if (!jpeg.contentEquals(sourceJpeg)) {
+                    runCatching { mediaStore.copyExif(sourceJpeg, savedUri) }
+                    runCatching { saveEditingOriginal(savedUri, sourceJpeg) }
+                        .onFailure { error ->
+                            DiagnosticLog.record(
+                                "editing_original_save_failed",
+                                mapOf("error" to error.toUserMessage("unknown")),
+                            )
+                        }
+                }
+                applyPhoneLocation(savedUri)
+                val saved = SavedCapture(
+                    uri = savedUri,
                     jpeg = jpeg,
                     originalSizeRequested = !previewFirst && remoteUri.requestsOriginalPostview(),
                     thumbnailRemoteUri = remoteCapture.thumbnailUri,
@@ -1444,6 +1497,7 @@ class SonyCameraRepository(context: Context) {
     }
 
     private companion object {
+        const val EDITING_ORIGINAL_DIRECTORY = "editing_originals"
         const val STOP_TIMEOUT_MILLIS = 1_500L
         const val CONTINUOUS_STOP_TIMEOUT_MILLIS = 2_000
         const val CONTINUOUS_CLOSE_STOP_TIMEOUT_MILLIS = 2_500L

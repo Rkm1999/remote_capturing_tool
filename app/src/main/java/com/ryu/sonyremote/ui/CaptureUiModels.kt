@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import com.ryu.sonyremote.data.CaptureWorkspace
 import com.ryu.sonyremote.processing.LutPreset
+import com.ryu.sonyremote.processing.RawRefineryDenoiseModel
 import com.ryu.sonyremote.processing.CubeLut
 import com.ryu.sonyremote.model.CameraSetting
 import com.ryu.sonyremote.model.CameraSettingId
@@ -20,6 +21,18 @@ enum class CaptureMode(val label: String) {
 enum class StackCaptureStrategy(val label: String) {
     SingleSequential("Single"),
     ContinuousBurst("Burst"),
+}
+
+enum class AutoDenoiseMode(val label: String) {
+    Off("Off"),
+    Always("Always"),
+    IsoThreshold("ISO threshold"),
+}
+
+internal fun shouldAutoDenoise(mode: AutoDenoiseMode, iso: Int?, threshold: Int): Boolean = when (mode) {
+    AutoDenoiseMode.Off -> false
+    AutoDenoiseMode.Always -> true
+    AutoDenoiseMode.IsoThreshold -> iso != null && iso >= threshold
 }
 
 enum class CaptureAssetKind(val label: String) {
@@ -359,10 +372,18 @@ data class LutEditorUiState(
     val exposure: Float = 0f,
     val contrast: Float = 0f,
     val saturation: Float = 0f,
+    val denoiseEnabled: Boolean = false,
+    val denoiseStrength: Float = 0.6f,
+    val denoiseModel: RawRefineryDenoiseModel = RawRefineryDenoiseModel.Light,
+    val sharpenEnabled: Boolean = false,
+    val sharpenStrength: Float = 0.15f,
     val lutThumbnails: Map<LutPreset, Bitmap> = emptyMap(),
     val importedLuts: List<ImportedLut> = emptyList(),
     val selectedImportedLabel: String? = null,
     val importedLutThumbnails: Map<String, Bitmap> = emptyMap(),
     val preview: Bitmap? = null,
     val isProcessing: Boolean = false,
-)
+) {
+    val effectiveDenoiseStrength: Float get() = denoiseStrength.takeIf { denoiseEnabled } ?: 0f
+    val effectiveSharpenStrength: Float get() = sharpenStrength.takeIf { sharpenEnabled } ?: 0f
+}

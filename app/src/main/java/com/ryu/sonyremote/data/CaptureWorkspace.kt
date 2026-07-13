@@ -5,15 +5,16 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-/** Temporary JPEG storage rooted below the application's cache directory. */
-class CaptureWorkspace(cacheDir: File) {
-    private val directory = File(cacheDir, DIRECTORY_NAME)
+/** Persistent private storage for computational source frames and their final-image relationships. */
+class CaptureWorkspace(filesDir: File) {
+    private val directory = File(filesDir, DIRECTORY_NAME)
     private val mutex = Mutex()
 
     class Item internal constructor(val name: String)
@@ -55,6 +56,31 @@ class CaptureWorkspace(cacheDir: File) {
         true
     }
 
+    suspend fun associate(finalKey: String, items: List<Item>) = lockedIo {
+        ensureDirectory()
+        items.forEach { require(resolve(it).isFile) { "Capture source item does not exist" } }
+        val destination = manifest(finalKey)
+        val temporary = File.createTempFile(MANIFEST_TEMP_PREFIX, TEMP_SUFFIX, directory)
+        try {
+            temporary.writeText(items.joinToString("\n", transform = Item::name))
+            Files.move(
+                temporary.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (error: Throwable) {
+            temporary.delete()
+            throw error
+        }
+    }
+
+    suspend fun relatedItems(finalKey: String): List<Item> = lockedIo {
+        val manifest = manifest(finalKey)
+        if (!manifest.isFile) return@lockedIo emptyList()
+        manifest.readLines().filter(ITEM_NAME::matches).map(::Item).filter { resolve(it).isFile }
+    }
+
     suspend fun clear() = lockedIo {
         if (!directory.exists()) return@lockedIo
         if (!directory.isDirectory) throw IOException("Capture workspace path is not a directory")
@@ -82,9 +108,17 @@ class CaptureWorkspace(cacheDir: File) {
         return File(directory, item.name)
     }
 
+    private fun manifest(finalKey: String): File {
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(finalKey.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return File(directory, "$key.sources")
+    }
+
     private companion object {
-        const val DIRECTORY_NAME = "computational-captures"
+        const val DIRECTORY_NAME = "computational-sources"
         const val TEMP_PREFIX = ".capture-"
+        const val MANIFEST_TEMP_PREFIX = ".sources-"
         const val TEMP_SUFFIX = ".tmp"
         val ITEM_NAME = Regex("capture_[0-9a-fA-F-]{36}\\.jpg")
     }

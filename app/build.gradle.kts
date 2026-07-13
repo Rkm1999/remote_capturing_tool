@@ -12,8 +12,8 @@ android {
         applicationId = "com.ryu.sonyremote"
         minSdk = 29
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0-beta"
+        versionCode = 3
+        versionName = "0.3.0-beta"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -67,6 +67,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.opencv)
+    implementation(libs.onnxruntime.android)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     androidTestImplementation(libs.androidx.test.ext.junit)

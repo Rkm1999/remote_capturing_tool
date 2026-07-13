@@ -29,8 +29,12 @@ class CaptureWorkspaceTest {
 
         assertEquals(items.size, items.map { it.name }.toSet().size)
         items.forEach { assertArrayEquals(normalized, workspace.readBytes(it)) }
-        val workspaceDirectory = File(temporaryFolder.root, "computational-captures")
+        val workspaceDirectory = File(temporaryFolder.root, "computational-sources")
         assertFalse(workspaceDirectory.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+
+        workspace.associate("content://gallery/final/1", items.take(3))
+        assertEquals(items.take(3).map { it.name }, workspace.relatedItems("content://gallery/final/1").map { it.name })
+        assertTrue(workspace.relatedItems("content://gallery/final/missing").isEmpty())
 
         assertTrue(workspace.delete(items.first()))
         assertFalse(workspace.delete(items.first()))

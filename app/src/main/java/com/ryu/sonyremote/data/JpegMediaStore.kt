@@ -22,6 +22,10 @@ import kotlinx.coroutines.withContext
 import com.ryu.sonyremote.model.OutputImageFormat
 
 class JpegMediaStore(private val contentResolver: ContentResolver) {
+    suspend fun delete(uri: Uri): Boolean = withContext(Dispatchers.IO) {
+        contentResolver.delete(uri, null, null) > 0
+    }
+
     suspend fun listSaved(): List<SavedMediaItem> = withContext(Dispatchers.IO) {
         val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val projection = arrayOf(
