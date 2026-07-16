@@ -30,3 +30,24 @@ OpenCV Android SDK under `sdk/etc/licenses`.
 
 - Project: https://github.com/junit-team/junit4
 - License: Eclipse Public License 1.0
+
+## RawRefinery
+
+- Source: https://github.com/rymuelle/RawRefinery
+- License: MIT
+- The Android and iOS apps include the Light denoise and Deep Sharpen ONNX
+  model weights.
+
+## ONNX Runtime
+
+- Source: https://github.com/microsoft/onnxruntime
+- License: MIT
+- The iOS app uses the official ONNX Runtime 1.20.0 iOS framework with the
+  Core ML execution provider.
+
+## libwebp
+
+- Source: https://chromium.googlesource.com/webm/libwebp
+- Swift package: https://github.com/SDWebImage/libwebp-Xcode
+- License: BSD 3-Clause
+- Used by the iOS app for WebP encoding.

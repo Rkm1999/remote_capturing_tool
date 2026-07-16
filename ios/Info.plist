@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Remote Capture</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Remote Capture connects directly to your camera over its Wi-Fi network.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Remote Capture can save downloaded camera photos to your photo library.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Remote Capture uses your location only when geotagging downloaded photos.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>3D LUT</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.ryu.cube-lut</string>
+                <string>public.zip-archive</string>
+            </array>
+        </dict>
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.ryu.cube-lut</string>
+            <key>UTTypeDescription</key>
+            <string>3D Cube LUT</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.text</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>cube</string></array></dict>
+        </dict>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>

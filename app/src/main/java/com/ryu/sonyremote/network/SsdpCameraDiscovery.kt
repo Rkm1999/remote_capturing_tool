@@ -3,6 +3,7 @@ package com.ryu.sonyremote.network
 import android.content.Context
 import android.net.Network
 import android.net.wifi.WifiManager
+import android.util.Log
 import com.ryu.sonyremote.protocol.SsdpResponseParser
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -46,6 +47,7 @@ class SsdpCameraDiscovery(context: Context) {
                             socket.receive(packet)
                             val body = String(packet.data, packet.offset, packet.length, Charsets.US_ASCII)
                             SsdpResponseParser.parse(body)?.let { response ->
+                                Log.i(LOG_TAG, "Sony camera SSDP location: ${response.location}")
                                 responses[response.location.toString()] = response.location
                             }
                         } catch (_: SocketTimeoutException) {
@@ -62,6 +64,7 @@ class SsdpCameraDiscovery(context: Context) {
     private companion object {
         const val SSDP_HOST = "239.255.255.250"
         const val SSDP_PORT = 1900
+        const val LOG_TAG = "SonyCameraDiscovery"
         val SEARCH_REQUEST = listOf(
             "M-SEARCH * HTTP/1.1",
             "HOST: $SSDP_HOST:$SSDP_PORT",
