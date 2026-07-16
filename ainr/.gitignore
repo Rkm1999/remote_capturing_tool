@@ -1,0 +1,9 @@
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+dist/
+ios/.build/
+ios/xtool/
+ios/*.ipa

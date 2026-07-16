@@ -117,6 +117,24 @@ Built-in and imported `.cube` LUTs appear in the bottom filmstrip. Photos saved
 with a LUT retain its name and strength in EXIF so the editor can restore the
 recorded selection later; edits are saved as a new copy.
 
+## AI NR Development
+
+The maintained standalone AI noise-reduction projects now live in [`ainr`](ainr):
+
+- [`ainr/app`](ainr/app) contains the Android LiteRT implementation with GPU,
+  vendor NPU, and dynamically balanced GPU + NPU execution.
+- [`ainr/ios`](ainr/ios) contains the native SwiftUI/Core ML implementation with
+  GPU, Apple Neural Engine, and dynamically balanced GPU + ANE execution.
+- [`ainr/verification`](ainr/verification) contains the 24 MP device benchmark
+  documentation and retained comparison images.
+- [`ainr/README.md`](ainr/README.md) documents shared compatibility, build steps,
+  accelerator behavior, and current verified performance.
+
+The standalone projects are kept separate from the camera applications while
+the accelerated SCUNet pipeline is evaluated for later editor integration. The
+Android `.tflite` model is approximately 106 MB and requires Git LFS before this
+directory can be committed to GitHub.
+
 ## Compatibility
 
 Remote Capture requires Android 10 or newer, Wi-Fi, and a Sony camera application

@@ -1,0 +1,45 @@
+plugins {
+    id("com.android.application")
+}
+
+android {
+    namespace = "com.ryu.scunetdenoiser"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "com.ryu.scunetdenoiser"
+        minSdk = 29
+        targetSdk = 36
+        versionCode = 4
+        versionName = "0.1.0-beta.1"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    androidResources {
+        noCompress += "tflite"
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    lint {
+        // Qualcomm's bundled compiler and HTP runtime are arm64-only.
+        disable += "ChromeOsAbiSupport"
+    }
+}
+
+dependencies {
+    implementation("com.google.ai.edge.litert:litert:2.1.6")
+    testImplementation("junit:junit:4.13.2")
+}

@@ -1,0 +1,14 @@
+<resources>
+    <color name="app_background">#141719</color>
+    <color name="surface">#1E2325</color>
+    <color name="surface_raised">#292F31</color>
+    <color name="preview_background">#080A0B</color>
+    <color name="text_primary">#F3F5F4</color>
+    <color name="text_secondary">#ADB7B3</color>
+    <color name="text_disabled">#68716E</color>
+    <color name="accent">#4FB286</color>
+    <color name="accent_pressed">#3D916D</color>
+    <color name="accent_dark">#193C2E</color>
+    <color name="border">#46504D</color>
+    <color name="warning">#E2A74B</color>
+</resources>

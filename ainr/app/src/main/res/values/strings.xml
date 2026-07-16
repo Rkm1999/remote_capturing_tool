@@ -1,0 +1,37 @@
+<resources>
+    <string name="app_name">SCUNet Denoiser</string>
+    <string name="choose_image">Choose image</string>
+    <string name="run_denoise">Run denoise</string>
+    <string name="save_image">Save image</string>
+    <string name="cancel">Cancel</string>
+    <string name="gpu">GPU</string>
+    <string name="npu">NPU</string>
+    <string name="gpu_npu">GPU + NPU</string>
+    <string name="npu_unavailable">NPU unavailable</string>
+    <string name="gpu_npu_unavailable">GPU + NPU unavailable</string>
+    <string name="ready">Ready</string>
+    <string name="tile_size">192 px</string>
+    <string name="image_preview">Image preview</string>
+    <string name="select_an_image">Select an image</string>
+    <string name="no_image_selected">No image selected</string>
+    <string name="accelerator">Accelerator</string>
+    <string name="compiling_npu">Compiling NPU on device</string>
+    <string name="denoising_complete">Denoising complete</string>
+    <string name="accelerator_ready">%1$s ready</string>
+    <string name="saved_location">Saved to Pictures / SCUNet Denoiser</string>
+    <string name="percent_format">%1$d%%</string>
+    <string name="saved_image">Saved %1$s</string>
+    <string name="npu_setup">NPU setup</string>
+    <string name="cancel_compiler">Cancel requested · compiler finishing</string>
+    <string name="cancel_tile">Canceling after current tile</string>
+    <string name="image_details_format">%1$s  ·  %2$d × %3$d</string>
+    <plurals name="denoising_tiles">
+        <item quantity="one">Denoising · %1$d / %2$d tile</item>
+        <item quantity="other">Denoising · %1$d / %2$d tiles</item>
+    </plurals>
+    <string name="gpu_ready">GPU ready</string>
+    <string name="npu_jit">NPU · on-device JIT</string>
+    <string name="npu_ready">NPU ready</string>
+    <string name="dual_jit">GPU + NPU · on-device JIT</string>
+    <string name="dual_ready">GPU + NPU ready</string>
+</resources>
