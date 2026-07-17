@@ -121,11 +121,30 @@ struct ContentView: View {
 
             Picker("Processor", selection: $viewModel.backend) {
                 ForEach(DenoiseBackend.allCases) { backend in
-                    Text(backend.pickerLabel).tag(backend)
+                    Text(backend.pickerLabel)
+                        .tag(backend)
+                        .disabled(
+                            viewModel.highOverlap
+                                && backend == .gpuAndNeuralEngine
+                        )
                 }
             }
             .pickerStyle(.segmented)
             .disabled(viewModel.isProcessing)
+            .onChange(of: viewModel.backend) { _, selected in
+                if viewModel.highOverlap && selected == .gpuAndNeuralEngine {
+                    viewModel.backend = .neuralEngine
+                }
+            }
+
+            Toggle("High overlap", isOn: $viewModel.highOverlap)
+                .font(.subheadline)
+                .disabled(viewModel.isProcessing)
+                .onChange(of: viewModel.highOverlap) { _, enabled in
+                    if enabled && viewModel.backend == .gpuAndNeuralEngine {
+                        viewModel.backend = .neuralEngine
+                    }
+                }
 
             if viewModel.isProcessing {
                 VStack(spacing: 5) {

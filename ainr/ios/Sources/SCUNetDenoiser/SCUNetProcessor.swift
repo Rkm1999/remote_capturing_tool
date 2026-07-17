@@ -395,6 +395,7 @@ actor SCUNetProcessor {
         sourceURL: URL,
         sourceName: String,
         backend: DenoiseBackend,
+        highOverlap: Bool,
         progress: @escaping @Sendable (DenoiseProgress) -> Void
     ) async throws -> DenoiseResult {
         let started = Date()
@@ -411,8 +412,9 @@ actor SCUNetProcessor {
         guard let dimensions = ImageCodec.imageDimensions(sourceURL) else {
             throw SCUNetError(message: "The image dimensions could not be read")
         }
-        let columns = Self.divideRoundUp(dimensions.0, Self.core)
-        let rows = Self.divideRoundUp(dimensions.1, Self.core)
+        let stride = highOverlap ? Self.tile / 2 : Self.core
+        let columns = Self.divideRoundUp(dimensions.0, stride) + (highOverlap ? 1 : 0)
+        let rows = Self.divideRoundUp(dimensions.1, stride) + (highOverlap ? 1 : 0)
         let totalTiles = columns * rows
         progress(.init(
             phase: .preparing,
@@ -450,6 +452,51 @@ actor SCUNetProcessor {
         var previousRow: [[Float]]?
         var completed = 0
 
+        if highOverlap {
+            let highOverlapSessions: [ModelSession]
+            switch execution {
+            case .single(let selected): highOverlapSessions = [selected]
+            case .combined(let neuralEngine, _): highOverlapSessions = [neuralEngine]
+            }
+            var input = [Float](repeating: 0, count: Self.tensorCount)
+            var band = [Float](repeating: 0, count: source.width * Self.tile * 3)
+            let weights = (0..<Self.tile).map { index -> Float in
+                let value = sin(Double.pi * (Double(index) + 0.5) / Double(Self.tile))
+                return Float(value * value)
+            }
+            var bandOrigin = -stride
+            for row in 0..<rows {
+                for column in 0..<columns {
+                    try Task.checkCancellation()
+                    let startX = column * stride - stride
+                    let startY = row * stride - stride
+                    let prepareStarted = ProcessInfo.processInfo.systemUptime
+                    Self.prepareTile(source.rgba, width: source.width, height: source.height,
+                        destination: &input, startX: startX, startY: startY)
+                    prepareSeconds += ProcessInfo.processInfo.systemUptime - prepareStarted
+                    let session = highOverlapSessions[completed % highOverlapSessions.count]
+                    let run = try await session.run(input)
+                    inputCopySeconds += run.inputCopySeconds
+                    predictionSeconds += run.predictionSeconds
+                    outputCopySeconds += run.outputCopySeconds
+                    let composeStarted = ProcessInfo.processInfo.systemUptime
+                    Self.addWeightedTile(run.output, to: &band, bandOrigin: bandOrigin,
+                        width: source.width, height: source.height,
+                        startX: startX, startY: startY, weights: weights)
+                    composeSeconds += ProcessInfo.processInfo.systemUptime - composeStarted
+                    completed += 1
+                    if completed == 1 || completed == totalTiles || completed.isMultiple(of: 2) {
+                        progress(.init(phase: .processing, completedTiles: completed,
+                            totalTiles: totalTiles, elapsedSeconds: Date().timeIntervalSince(started)))
+                    }
+                }
+                Self.flushWeightedBand(&band, into: &destination, width: source.width,
+                    height: source.height, bandOrigin: bandOrigin, rowCount: stride)
+                bandOrigin += stride
+            }
+            Self.flushWeightedBand(&band, into: &destination, width: source.width,
+                height: source.height, bandOrigin: bandOrigin, rowCount: Self.tile)
+        } else {
         switch execution {
         case .single(let session):
             var input = [Float](repeating: 0, count: Self.tensorCount)
@@ -595,6 +642,7 @@ actor SCUNetProcessor {
             orderedTiles.removeAll(keepingCapacity: false)
             aneBand.tiles.removeAll(keepingCapacity: false)
             gpuBand.tiles.removeAll(keepingCapacity: false)
+        }
         }
 
         try Task.checkCancellation()
@@ -794,6 +842,69 @@ actor SCUNetProcessor {
             )
         }
         currentRow.append(output)
+    }
+
+    private static func addWeightedTile(
+        _ tile: [Float],
+        to band: inout [Float],
+        bandOrigin: Int,
+        width: Int,
+        height: Int,
+        startX: Int,
+        startY: Int,
+        weights: [Float]
+    ) {
+        let x0 = max(0, startX)
+        let x1 = min(width, startX + Self.tile)
+        let y0 = max(0, startY)
+        let y1 = min(height, startY + Self.tile)
+        guard x0 < x1, y0 < y1 else { return }
+        for y in y0..<y1 {
+            let tileY = y - startY
+            let bandY = y - bandOrigin
+            let wy = weights[tileY]
+            for x in x0..<x1 {
+                let tileIndex = tileY * Self.tile + x - startX
+                let bandIndex = (bandY * width + x) * 3
+                let weight = wy * weights[x - startX]
+                band[bandIndex] += tile[tileIndex] * weight
+                band[bandIndex + 1] += tile[Self.plane + tileIndex] * weight
+                band[bandIndex + 2] += tile[2 * Self.plane + tileIndex] * weight
+            }
+        }
+    }
+
+    private static func flushWeightedBand(
+        _ band: inout [Float],
+        into destination: inout [UInt8],
+        width: Int,
+        height: Int,
+        bandOrigin: Int,
+        rowCount: Int
+    ) {
+        let y0 = max(0, bandOrigin)
+        let y1 = min(height, bandOrigin + rowCount)
+        if y0 < y1 {
+            for y in y0..<y1 {
+                let sourceOffset = (y - bandOrigin) * width * 3
+                let destinationOffset = y * width * 3
+                for index in 0..<(width * 3) {
+                    destination[destinationOffset + index] = UInt8(clamping:
+                        Int((band[sourceOffset + index] * 255).rounded()))
+                }
+            }
+        }
+        let shift = min(rowCount, Self.tile) * width * 3
+        let bandCount = band.count
+        let retained = bandCount - shift
+        band.withUnsafeMutableBufferPointer { values in
+            guard let base = values.baseAddress else { return }
+            if retained > 0 {
+                memmove(base, base.advanced(by: shift), retained * MemoryLayout<Float>.stride)
+            }
+            memset(base.advanced(by: retained), 0,
+                (bandCount - retained) * MemoryLayout<Float>.stride)
+        }
     }
 
     private static func prepareTile(

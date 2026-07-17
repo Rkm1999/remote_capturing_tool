@@ -12,6 +12,7 @@ Native SwiftUI port of the standalone full-resolution SCUNet denoiser.
   feathered context on every edge
 - Select GPU, Neural Engine, GPU + Neural Engine, or CPU execution explicitly
 - Show model preparation, tile progress, elapsed time, and the selected backend
+- Optionally use 50% whole-tile weighted overlap to suppress checkerboard patterns
 - Cancel between tiles, compare original and result, then save or share the JPEG
 
 The app uses one native Core ML ML Program with FP16 weights and FP32 input and

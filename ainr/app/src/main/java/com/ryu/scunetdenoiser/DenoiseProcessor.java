@@ -21,6 +21,11 @@ final class DenoiseProcessor {
         DUAL
     }
 
+    enum OverlapMode {
+        FAST,
+        HIGH
+    }
+
     interface ProgressListener {
         void onProgress(int complete, int total, long elapsedMillis);
     }
@@ -37,12 +42,16 @@ final class DenoiseProcessor {
         int width,
         int height,
         Mode mode,
+        OverlapMode overlapMode,
         AcceleratorEngine gpu,
         AcceleratorEngine npu,
         AtomicBoolean canceled,
         ProgressListener listener
     ) throws Exception {
         validateImage(source, width, height);
+        if (overlapMode == OverlapMode.HIGH) {
+            return processHighOverlap(source, width, height, mode, gpu, npu, canceled, listener);
+        }
         int columns = divideRoundUp(width, CORE);
         int rows = divideRoundUp(height, CORE);
         int total = columns * rows;
@@ -86,6 +95,85 @@ final class DenoiseProcessor {
 
     static int tileCount(int width, int height) {
         return divideRoundUp(width, CORE) * divideRoundUp(height, CORE);
+    }
+
+    static int tileCount(int width, int height, OverlapMode overlapMode) {
+        if (overlapMode == OverlapMode.HIGH) {
+            return (divideRoundUp(width, TILE / 2) + 1)
+                * (divideRoundUp(height, TILE / 2) + 1);
+        }
+        return tileCount(width, height);
+    }
+
+    private byte[] processHighOverlap(
+        byte[] source,
+        int width,
+        int height,
+        Mode mode,
+        AcceleratorEngine gpu,
+        AcceleratorEngine npu,
+        AtomicBoolean canceled,
+        ProgressListener listener
+    ) throws Exception {
+        final int stride = TILE / 2;
+        int columns = divideRoundUp(width, stride) + 1;
+        int rows = divideRoundUp(height, stride) + 1;
+        int total = columns * rows;
+        byte[] result = new byte[source.length];
+        AtomicInteger complete = new AtomicInteger();
+        long started = SystemClock.elapsedRealtime();
+        WeightedOrderedComposer composer = new WeightedOrderedComposer(
+            result, width, height, columns, total, stride);
+
+        // Mixing delegate outputs tile-by-tile can create a new 96 px pattern.
+        // High overlap prioritizes consistent output and uses one backend.
+        if (mode == Mode.GPU || mode == Mode.NPU || mode == Mode.DUAL) {
+            AcceleratorEngine engine = mode == Mode.NPU ? require(npu, "NPU") : require(gpu, "GPU");
+            processHighTiles(source, width, height, columns, engine, null, composer,
+                canceled, complete, total, started, listener);
+            composer.finish();
+            return result;
+        }
+
+        throw new IllegalStateException("Unsupported accelerator mode");
+    }
+
+    private WorkerResult processHighTiles(
+        byte[] source, int width, int height, int columns,
+        AcceleratorEngine engine, TileScheduler scheduler,
+        WeightedOrderedComposer composer, AtomicBoolean canceled,
+        AtomicInteger complete, int total, long started, ProgressListener listener
+    ) throws Exception {
+        long wallStarted = SystemClock.elapsedRealtimeNanos();
+        long inferenceNanos = 0;
+        int processed = 0;
+        int maximumIndex = -1;
+        float[] input = new float[TENSOR_ELEMENTS];
+        while (true) {
+            checkCanceled(canceled);
+            int index = scheduler == null ? processed : scheduler.claim(true);
+            if (index < 0 || index >= total) break;
+            int row = index / columns;
+            int column = index % columns;
+            int stride = TILE / 2;
+            prepareTile(source, width, height, input,
+                column * stride - stride, row * stride - stride);
+            long inferenceStarted = SystemClock.elapsedRealtimeNanos();
+            float[] output = engine.infer(input);
+            inferenceNanos += SystemClock.elapsedRealtimeNanos() - inferenceStarted;
+            if (output.length != TENSOR_ELEMENTS) {
+                throw new IllegalStateException(engine.kind() + " returned " + output.length + " values");
+            }
+            composer.submit(index, output);
+            processed++;
+            maximumIndex = Math.max(maximumIndex, index);
+            int done = complete.incrementAndGet();
+            if (done == 1 || done == total || done % 4 == 0) {
+                listener.onProgress(done, total, SystemClock.elapsedRealtime() - started);
+            }
+        }
+        return new WorkerResult(processed, maximumIndex,
+            SystemClock.elapsedRealtimeNanos() - wallStarted, inferenceNanos);
     }
 
     private void processRows(
@@ -508,6 +596,96 @@ final class DenoiseProcessor {
                 throw new IllegalStateException(
                     "Missing completed tile " + nextIndex + " of " + pending.length);
             }
+        }
+    }
+
+    /** Streaming whole-tile overlap-add; only two tile rows are retained. */
+    private static final class WeightedOrderedComposer {
+        private final byte[] result;
+        private final int width;
+        private final int height;
+        private final int columns;
+        private final int stride;
+        private final float[][] pending;
+        private final float[] weights = new float[TILE];
+        private final float[] band;
+        private int nextIndex;
+        private int bandOrigin;
+
+        WeightedOrderedComposer(
+            byte[] result, int width, int height, int columns, int total, int stride
+        ) {
+            this.result = result;
+            this.width = width;
+            this.height = height;
+            this.columns = columns;
+            this.stride = stride;
+            pending = new float[total][];
+            band = new float[width * TILE * 3];
+            bandOrigin = -stride;
+            for (int i = 0; i < TILE; i++) {
+                double angle = Math.PI * (i + 0.5) / TILE;
+                weights[i] = (float) (Math.sin(angle) * Math.sin(angle));
+            }
+        }
+
+        synchronized void submit(int index, float[] output) {
+            if (index < nextIndex || index >= pending.length || pending[index] != null) {
+                throw new IllegalStateException("Duplicate or invalid completed tile " + index);
+            }
+            pending[index] = output;
+            while (nextIndex < pending.length && pending[nextIndex] != null) {
+                int row = nextIndex / columns;
+                int column = nextIndex % columns;
+                float[] tile = pending[nextIndex];
+                pending[nextIndex] = null;
+                add(tile, column * stride - stride, row * stride - stride);
+                nextIndex++;
+                if (column == columns - 1) flush(stride);
+            }
+        }
+
+        private void add(float[] tile, int startX, int startY) {
+            int x0 = Math.max(0, startX);
+            int x1 = Math.min(width, startX + TILE);
+            int y0 = Math.max(0, startY);
+            int y1 = Math.min(height, startY + TILE);
+            for (int y = y0; y < y1; y++) {
+                int tileY = y - startY;
+                int bandY = y - bandOrigin;
+                float wy = weights[tileY];
+                for (int x = x0; x < x1; x++) {
+                    int tileIndex = tileY * TILE + x - startX;
+                    int bandIndex = (bandY * width + x) * 3;
+                    float weight = wy * weights[x - startX];
+                    band[bandIndex] += tile[tileIndex] * weight;
+                    band[bandIndex + 1] += tile[PLANE + tileIndex] * weight;
+                    band[bandIndex + 2] += tile[2 * PLANE + tileIndex] * weight;
+                }
+            }
+        }
+
+        private void flush(int rows) {
+            int y0 = Math.max(0, bandOrigin);
+            int y1 = Math.min(height, bandOrigin + rows);
+            for (int y = y0; y < y1; y++) {
+                int bandOffset = (y - bandOrigin) * width * 3;
+                int resultOffset = y * width * 3;
+                for (int i = 0; i < width * 3; i++) {
+                    result[resultOffset + i] = toByte(band[bandOffset + i]);
+                }
+            }
+            int retained = (TILE - rows) * width * 3;
+            System.arraycopy(band, rows * width * 3, band, 0, retained);
+            java.util.Arrays.fill(band, retained, band.length, 0f);
+            bandOrigin += rows;
+        }
+
+        synchronized void finish() {
+            if (nextIndex != pending.length) {
+                throw new IllegalStateException("Missing completed tile " + nextIndex);
+            }
+            flush(TILE);
         }
     }
 

@@ -20,6 +20,7 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.Switch;
 
 import java.io.File;
 import java.util.Locale;
@@ -52,6 +53,7 @@ public final class MainActivity extends Activity {
     private ImageView imagePreview;
     private ProgressBar progressBar;
     private RadioGroup backendGroup;
+    private Switch highOverlapSwitch;
     private RadioButton npuButton;
     private RadioButton dualButton;
     private Button chooseButton;
@@ -109,6 +111,9 @@ public final class MainActivity extends Activity {
         imagePreview = findViewById(R.id.image_preview);
         progressBar = findViewById(R.id.progress_bar);
         backendGroup = findViewById(R.id.backend_group);
+        highOverlapSwitch = findViewById(R.id.high_overlap_switch);
+        highOverlapSwitch.setChecked(getPreferences(MODE_PRIVATE)
+            .getBoolean("high_overlap", false));
         npuButton = findViewById(R.id.backend_npu);
         dualButton = findViewById(R.id.backend_dual);
         chooseButton = findViewById(R.id.choose_button);
@@ -125,6 +130,13 @@ public final class MainActivity extends Activity {
         cancelButton.setOnClickListener(view -> requestCancellation());
         saveButton.setOnClickListener(view -> saveCompletedImage());
         backendGroup.setOnCheckedChangeListener((group, checkedId) -> updateSessionLabel());
+        highOverlapSwitch.setOnCheckedChangeListener((button, checked) -> {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("high_overlap", checked).apply();
+            if (checked && selectedMode() == DenoiseProcessor.Mode.DUAL) {
+                backendGroup.check(R.id.backend_gpu);
+            }
+            applyNpuAvailability();
+        });
     }
 
     private void openImagePicker() {
@@ -210,6 +222,9 @@ public final class MainActivity extends Activity {
         Uri sourceUri = selectedUri;
         if (busy || sourceUri == null) return;
         DenoiseProcessor.Mode mode = selectedMode();
+        DenoiseProcessor.OverlapMode overlapMode = highOverlapSwitch.isChecked()
+            ? DenoiseProcessor.OverlapMode.HIGH
+            : DenoiseProcessor.OverlapMode.FAST;
         currentCancellation = new AtomicBoolean();
         AtomicBoolean cancellation = currentCancellation;
         clearCompletedImage();
@@ -233,7 +248,7 @@ public final class MainActivity extends Activity {
                 checkCanceled(cancellation);
                 final int width = input.width;
                 final int height = input.height;
-                final int tiles = DenoiseProcessor.tileCount(width, height);
+                final int tiles = DenoiseProcessor.tileCount(width, height, overlapMode);
                 post(() -> {
                     imageDetails.setText(getString(
                         R.string.image_details_format,
@@ -250,6 +265,7 @@ public final class MainActivity extends Activity {
                     width,
                     height,
                     mode,
+                    overlapMode,
                     gpuEngine,
                     npuEngine,
                     cancellation,
@@ -446,12 +462,13 @@ public final class MainActivity extends Activity {
         runButton.setEnabled(!value && selectedUri != null);
         saveButton.setEnabled(!value && completedFile != null && completedFile.isFile());
         backendGroup.setEnabled(!value);
+        highOverlapSwitch.setEnabled(!value);
         for (int index = 0; index < backendGroup.getChildCount(); index++) {
             backendGroup.getChildAt(index).setEnabled(!value);
         }
         boolean npuAvailable = npuVendor != NpuSupport.Vendor.UNSUPPORTED;
         npuButton.setEnabled(!value && npuAvailable);
-        dualButton.setEnabled(!value && npuAvailable);
+        dualButton.setEnabled(!value && npuAvailable && !highOverlapSwitch.isChecked());
         cancelButton.setVisibility(value ? View.VISIBLE : View.GONE);
         cancelButton.setEnabled(value);
         LinearLayout.LayoutParams saveLayout =
@@ -482,7 +499,7 @@ public final class MainActivity extends Activity {
     private void applyNpuAvailability() {
         boolean available = npuVendor != NpuSupport.Vendor.UNSUPPORTED;
         npuButton.setEnabled(available);
-        dualButton.setEnabled(available);
+        dualButton.setEnabled(available && !highOverlapSwitch.isChecked());
         if (available) {
             String description = NpuSupport.displayName(npuVendor);
             npuButton.setContentDescription("NPU · " + description);

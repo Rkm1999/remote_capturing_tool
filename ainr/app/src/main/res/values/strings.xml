@@ -15,6 +15,8 @@
     <string name="select_an_image">Select an image</string>
     <string name="no_image_selected">No image selected</string>
     <string name="accelerator">Accelerator</string>
+    <string name="high_overlap">High overlap</string>
+    <string name="high_overlap_summary">Suppress tile patterns · slower</string>
     <string name="compiling_npu">Compiling NPU on device</string>
     <string name="denoising_complete">Denoising complete</string>
     <string name="accelerator_ready">%1$s ready</string>

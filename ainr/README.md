@@ -122,6 +122,14 @@ composition. Neural Engine remains the default based on its sustained speed,
 lower memory use, and lower thermal load. The app does not identify a failed
 delegate request as accelerated execution.
 
+Android and iOS also provide an optional **High overlap** mode for photos that
+show a checkerboard tile pattern. It advances 192 x 192 tiles by 96 pixels and
+combines their complete area with cosine weights. It is off by default because
+it processes roughly three times as many tiles; normal mode retains the faster
+8-pixel edge blending. High overlap uses one accelerator consistently because
+mixing GPU and NPU/Neural Engine output across adjacent tiles can introduce a
+new periodic pattern.
+
 Build the signed IPA from Linux with `xtool`:
 
 ```bash

@@ -32,6 +32,9 @@ final class DenoiseViewModel: ObservableObject {
     @Published var backend: DenoiseBackend {
         didSet { UserDefaults.standard.set(backend.rawValue, forKey: Self.backendKey) }
     }
+    @Published var highOverlap: Bool {
+        didSet { UserDefaults.standard.set(highOverlap, forKey: Self.highOverlapKey) }
+    }
     @Published var previewMode: PreviewMode = .original
     @Published var progress: DenoiseProgress?
     @Published var status = "Choose a photo"
@@ -43,6 +46,7 @@ final class DenoiseViewModel: ObservableObject {
     @Published var processingStartedAt: Date?
 
     private static let backendKey = "SCUNetBackend"
+    private static let highOverlapKey = "SCUNetHighOverlap"
     private let processor = SCUNetProcessor.shared
     private var sourceURL: URL?
     private var importTask: Task<Void, Never>?
@@ -51,6 +55,7 @@ final class DenoiseViewModel: ObservableObject {
     private var runAfterImport = false
 
     init() {
+        highOverlap = UserDefaults.standard.bool(forKey: Self.highOverlapKey)
         let saved = UserDefaults.standard.string(forKey: Self.backendKey)
         if let requested = CommandLine.arguments.first(where: {
             $0.hasPrefix("--scunet-backend=")
@@ -114,7 +119,7 @@ final class DenoiseViewModel: ObservableObject {
         }
         runAfterImport = runWhenReady
         beginImport {
-            try Self.selection(url: url, name: "Sony 24 MP - ISO 51200.JPG")
+            try Self.selection(url: url, name: "Checkerboard test - ISO 25600.JPG")
         }
     }
 
@@ -130,6 +135,7 @@ final class DenoiseViewModel: ObservableObject {
         previewMode = .original
         status = "Preparing \(backend.rawValue). First run can take longer."
         let selectedBackend = backend
+        let selectedHighOverlap = highOverlap
         let selectedName = sourceName
 
         processingTask = Task { [weak self] in
@@ -138,7 +144,8 @@ final class DenoiseViewModel: ObservableObject {
                 let completed = try await processor.process(
                     sourceURL: sourceURL,
                     sourceName: selectedName,
-                    backend: selectedBackend
+                    backend: selectedBackend,
+                    highOverlap: selectedHighOverlap
                 ) { [weak self] update in
                     Task { @MainActor in
                         guard let self, self.runID == currentRun else { return }
