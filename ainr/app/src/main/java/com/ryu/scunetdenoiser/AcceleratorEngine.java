@@ -43,7 +43,11 @@ final class AcceleratorEngine implements AutoCloseable {
         this.outputs = outputs;
     }
 
-    static AcceleratorEngine createGpu(Context context, File modelFile) throws Exception {
+    static AcceleratorEngine createGpu(
+        Context context,
+        File modelFile,
+        String modelCacheKey
+    ) throws Exception {
         File cacheDir = new File(context.getCacheDir(), "litert_gpu");
         if (!cacheDir.isDirectory() && !cacheDir.mkdirs()) {
             throw new IllegalStateException("Could not create GPU cache directory");
@@ -57,7 +61,7 @@ final class AcceleratorEngine implements AutoCloseable {
             CompiledModel.GpuOptions.BufferStorageType.DEFAULT,
             null,
             cacheDir.getAbsolutePath(),
-            "scunet_192_fp16_v1",
+            "scunet_192_" + modelCacheKey.substring(0, 16),
             Boolean.TRUE,
             null,
             null,
@@ -70,17 +74,24 @@ final class AcceleratorEngine implements AutoCloseable {
         return createBuffers(Kind.GPU, null, model);
     }
 
-    static AcceleratorEngine createNpu(Context context, File modelFile) throws Exception {
+    static AcceleratorEngine createNpu(
+        Context context,
+        File modelFile,
+        String modelCacheKey
+    ) throws Exception {
         NpuSupport.Vendor vendor = NpuSupport.detect();
         if (vendor == NpuSupport.Vendor.UNSUPPORTED) {
             throw new IllegalStateException(
                 "NPU is not supported on " + NpuSupport.deviceSummary());
         }
+        File pluginDir = preparePluginDirectory(context, vendor);
         if (vendor == NpuSupport.Vendor.QUALCOMM) {
+            // Cache-key generation queries QNN before LiteRT configures FastRPC.
+            // Expose the packaged DSP image early so that query can succeed.
+            Os.setenv("ADSP_LIBRARY_PATH", pluginDir.getAbsolutePath(), true);
             System.loadLibrary("QnnSystem");
             System.loadLibrary("QnnHtp");
         }
-        File pluginDir = preparePluginDirectory(context, vendor);
         Map<Environment.Option, String> environmentOptions =
             new EnumMap<>(Environment.Option.class);
         environmentOptions.put(
@@ -89,7 +100,10 @@ final class AcceleratorEngine implements AutoCloseable {
         environmentOptions.put(
             Environment.Option.DispatchLibraryDir,
             pluginDir.getAbsolutePath());
-        Environment environment = Environment.create(environmentOptions);
+        Environment environment = CachedEnvironmentFactory.create(
+            context,
+            environmentOptions,
+            "litert-2.1.6-" + modelCacheKey.substring(0, 16));
         try {
             CompiledModel.Options options = new CompiledModel.Options(Accelerator.NPU);
             if (vendor == NpuSupport.Vendor.QUALCOMM) {

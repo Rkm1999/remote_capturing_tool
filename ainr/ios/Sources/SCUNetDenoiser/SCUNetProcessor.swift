@@ -32,6 +32,27 @@ enum DenoiseBackend: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum DenoiseQuality: String, CaseIterable, Identifiable, Sendable {
+    case highPerformance = "High Performance"
+    case highQuality = "High Quality"
+
+    var id: Self { self }
+
+    var pickerLabel: String {
+        switch self {
+        case .highPerformance: "Performance · LiteDenoise"
+        case .highQuality: "Quality · 16-bit"
+        }
+    }
+
+    var modelSuffix: String {
+        switch self {
+        case .highPerformance: "int8"
+        case .highQuality: "fp16"
+        }
+    }
+}
+
 struct DenoiseProgress: Sendable {
     enum Phase: String, Sendable {
         case loading = "Loading full-resolution image"
@@ -57,6 +78,7 @@ struct DenoiseResult: Sendable {
     let height: Int
     let elapsedSeconds: TimeInterval
     let backendLabel: String
+    let quality: DenoiseQuality
 }
 
 struct SCUNetError: LocalizedError, Sendable {
@@ -389,12 +411,18 @@ actor SCUNetProcessor {
         prefix: "--scunet-benchmark-tiles="
     ).flatMap(Int.init)
 
-    private var sessions: [DenoiseBackend: ModelSession] = [:]
+    private struct SessionKey: Hashable {
+        let backend: DenoiseBackend
+        let quality: DenoiseQuality
+    }
+
+    private var sessions: [SessionKey: ModelSession] = [:]
 
     func process(
         sourceURL: URL,
         sourceName: String,
         backend: DenoiseBackend,
+        quality: DenoiseQuality,
         highOverlap: Bool,
         progress: @escaping @Sendable (DenoiseProgress) -> Void
     ) async throws -> DenoiseResult {
@@ -425,7 +453,7 @@ actor SCUNetProcessor {
 
         Self.logger.notice("Preparing \(backend.rawValue, privacy: .public) model session")
         let modelStarted = ProcessInfo.processInfo.systemUptime
-        let execution = try await executionSessions(for: backend)
+        let execution = try await executionSessions(for: backend, quality: quality)
         modelLoadSeconds = ProcessInfo.processInfo.systemUptime - modelStarted
         let backendLabel = execution.label
         Self.logger.notice("Model session ready on \(backendLabel, privacy: .public)")
@@ -556,6 +584,7 @@ actor SCUNetProcessor {
                     if let limit = Self.benchmarkTileLimit,
                        completed >= min(limit, totalTiles) {
                         Self.logProfile(
+                            quality: quality,
                             completedTiles: completed,
                             totalSeconds: ProcessInfo.processInfo.systemUptime - startedUptime,
                             modelLoadSeconds: modelLoadSeconds,
@@ -658,10 +687,12 @@ actor SCUNetProcessor {
             destination,
             width: source.width,
             height: source.height,
+            metadataSourceURL: sourceURL,
             destinationURL: outputURL
         )
         encodeSeconds = ProcessInfo.processInfo.systemUptime - encodeStarted
         Self.logProfile(
+            quality: quality,
             completedTiles: completed,
             totalSeconds: ProcessInfo.processInfo.systemUptime - startedUptime,
             modelLoadSeconds: modelLoadSeconds,
@@ -681,26 +712,36 @@ actor SCUNetProcessor {
             width: source.width,
             height: source.height,
             elapsedSeconds: Date().timeIntervalSince(started),
-            backendLabel: backendLabel
+            backendLabel: backendLabel,
+            quality: quality
         )
     }
 
-    private func executionSessions(for backend: DenoiseBackend) async throws -> ExecutionSessions {
+    private func executionSessions(
+        for backend: DenoiseBackend,
+        quality: DenoiseQuality
+    ) async throws -> ExecutionSessions {
         if backend == .gpuAndNeuralEngine {
-            let neuralEngine = try await modelSession(for: .neuralEngine)
-            let gpu = try await modelSession(for: .gpu)
+            let neuralEngine = try await modelSession(for: .neuralEngine, quality: quality)
+            let gpu = try await modelSession(for: .gpu, quality: quality)
             return .combined(neuralEngine: neuralEngine, gpu: gpu)
         }
-        return .single(try await modelSession(for: backend))
+        return .single(try await modelSession(for: backend, quality: quality))
     }
 
-    private func modelSession(for backend: DenoiseBackend) async throws -> ModelSession {
-        if let existing = sessions[backend] { return existing }
+    private func modelSession(
+        for backend: DenoiseBackend,
+        quality: DenoiseQuality
+    ) async throws -> ModelSession {
+        let sessionKey = SessionKey(backend: backend, quality: quality)
+        if let existing = sessions[sessionKey] { return existing }
         let resourceName: String
-        if Self.modelVariant == "baseline", Self.tile == 192 {
+        if Self.tile == 192, quality == .highPerformance {
+            resourceName = "litedenoise_192_fp16"
+        } else if Self.modelVariant == "baseline", Self.tile == 192, quality == .highQuality {
             resourceName = "scunet_192_baseline_fp16"
         } else {
-            resourceName = "scunet_\(Self.tile)_fp16"
+            resourceName = "scunet_\(Self.tile)_\(quality.modelSuffix)"
         }
         guard let modelURL = Bundle.module.url(
             forResource: resourceName,
@@ -712,11 +753,11 @@ actor SCUNetProcessor {
 
         let created = try await ModelSession.load(
             modelURL: modelURL,
-            modelKey: "\(resourceName)_v3",
+            modelKey: "\(resourceName)_v1",
             tileSize: Self.tile,
             backend: backend
         )
-        sessions[backend] = created
+        sessions[sessionKey] = created
         return created
     }
 
@@ -1140,6 +1181,7 @@ actor SCUNetProcessor {
     }
 
     private static func logProfile(
+        quality: DenoiseQuality,
         completedTiles: Int,
         totalSeconds: TimeInterval,
         modelLoadSeconds: TimeInterval,
@@ -1161,9 +1203,10 @@ actor SCUNetProcessor {
             ? predictionSeconds * 1_000 / Double(completedTiles)
             : 0
         let detail = String(
-            format: "SCUNET_PROFILE tile=%d variant=%@ completed=%d total=%.3f model=%.3f decode=%.3f prepare=%.3f input_copy=%.3f prediction=%.3f prediction_mean_ms=%.3f output_copy=%.3f compose=%.3f encode=%.3f other=%.3f",
+            format: "SCUNET_PROFILE tile=%d variant=%@ weights=%@ completed=%d total=%.3f model=%.3f decode=%.3f prepare=%.3f input_copy=%.3f prediction=%.3f prediction_mean_ms=%.3f output_copy=%.3f compose=%.3f encode=%.3f other=%.3f",
             tile,
             modelVariant,
+            quality.modelSuffix,
             completedTiles,
             totalSeconds,
             modelLoadSeconds,
@@ -1273,6 +1316,7 @@ enum ImageCodec {
         _ rgb: [UInt8],
         width: Int,
         height: Int,
+        metadataSourceURL: URL,
         destinationURL: URL
     ) throws {
         guard rgb.count == width * height * 3,
@@ -1298,10 +1342,19 @@ enum ImageCodec {
               ) else {
             throw SCUNetError(message: "Could not create the JPEG output")
         }
-        let options: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 0.95,
-            kCGImagePropertyOrientation: 1,
-        ]
+        var options = (
+            CGImageSourceCreateWithURL(metadataSourceURL as CFURL, nil)
+                .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) }
+                as? [CFString: Any]
+        ) ?? [:]
+        options[kCGImageDestinationLossyCompressionQuality] = 0.95
+        options[kCGImagePropertyOrientation] = 1
+        options[kCGImagePropertyPixelWidth] = width
+        options[kCGImagePropertyPixelHeight] = height
+        var exif = options[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
+        exif[kCGImagePropertyExifPixelXDimension] = width
+        exif[kCGImagePropertyExifPixelYDimension] = height
+        options[kCGImagePropertyExifDictionary] = exif
         CGImageDestinationAddImage(destination, image, options as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
             throw SCUNetError(message: "JPEG encoding failed")

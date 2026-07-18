@@ -1,3 +1,4 @@
 version: 1
 bundleID: com.ryu.scunetdenoiser.ios.beta
 infoPath: Info.plist
+iconPath: AppIcon.png

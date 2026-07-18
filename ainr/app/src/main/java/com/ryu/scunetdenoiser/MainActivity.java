@@ -2,6 +2,8 @@ package com.ryu.scunetdenoiser;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.ClipData;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Build;
@@ -9,6 +11,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
@@ -23,6 +27,8 @@ import android.widget.Toast;
 import android.widget.Switch;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
@@ -53,6 +59,7 @@ public final class MainActivity extends Activity {
     private ImageView imagePreview;
     private ProgressBar progressBar;
     private RadioGroup backendGroup;
+    private RadioGroup qualityGroup;
     private Switch highOverlapSwitch;
     private RadioButton npuButton;
     private RadioButton dualButton;
@@ -61,7 +68,8 @@ public final class MainActivity extends Activity {
     private Button cancelButton;
     private Button saveButton;
 
-    private Uri selectedUri;
+    private final List<SelectedImage> selectedImages = new ArrayList<>();
+    private final List<CompletedImage> completedImages = new ArrayList<>();
     private String selectedName = "image";
     private Bitmap displayedPreview;
     private File completedFile;
@@ -69,6 +77,7 @@ public final class MainActivity extends Activity {
     private int completedHeight;
     private AcceleratorEngine gpuEngine;
     private AcceleratorEngine npuEngine;
+    private ModelStore.Quality engineQuality;
     private AtomicBoolean currentCancellation = new AtomicBoolean();
     private boolean busy;
     private boolean destroyed;
@@ -111,6 +120,11 @@ public final class MainActivity extends Activity {
         imagePreview = findViewById(R.id.image_preview);
         progressBar = findViewById(R.id.progress_bar);
         backendGroup = findViewById(R.id.backend_group);
+        qualityGroup = findViewById(R.id.quality_group);
+        qualityGroup.check(getPreferences(MODE_PRIVATE).getBoolean(
+            "high_performance_model", false)
+            ? R.id.quality_fast
+            : R.id.quality_high);
         highOverlapSwitch = findViewById(R.id.high_overlap_switch);
         highOverlapSwitch.setChecked(getPreferences(MODE_PRIVATE)
             .getBoolean("high_overlap", false));
@@ -130,6 +144,14 @@ public final class MainActivity extends Activity {
         cancelButton.setOnClickListener(view -> requestCancellation());
         saveButton.setOnClickListener(view -> saveCompletedImage());
         backendGroup.setOnCheckedChangeListener((group, checkedId) -> updateSessionLabel());
+        qualityGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            boolean highPerformance = checkedId == R.id.quality_fast;
+            getPreferences(MODE_PRIVATE).edit()
+                .putBoolean("high_performance_model", highPerformance)
+                .apply();
+            applyNpuAvailability();
+            updateSessionLabel();
+        });
         highOverlapSwitch.setOnCheckedChangeListener((button, checked) -> {
             getPreferences(MODE_PRIVATE).edit().putBoolean("high_overlap", checked).apply();
             if (checked && selectedMode() == DenoiseProcessor.Mode.DUAL) {
@@ -140,11 +162,22 @@ public final class MainActivity extends Activity {
     }
 
     private void openImagePicker() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("image/*");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= 33) {
+            intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType("image/*");
+            intent.putExtra(
+                MediaStore.EXTRA_PICK_IMAGES_MAX,
+                MediaStore.getPickImagesMaxLimit());
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } else {
+            intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("image/*");
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        }
         startActivityForResult(intent, OPEN_IMAGE_REQUEST);
     }
 
@@ -152,17 +185,19 @@ public final class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != OPEN_IMAGE_REQUEST || resultCode != RESULT_OK || data == null) return;
-        Uri uri = data.getData();
-        if (uri == null) return;
-        if ((data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
-            try {
-                getContentResolver().takePersistableUriPermission(
-                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (SecurityException ignored) {
-                // Some providers grant access only for the current process.
+        ArrayList<Uri> uris = new ArrayList<>();
+        ClipData clip = data.getClipData();
+        if (clip != null) {
+            for (int index = 0; index < clip.getItemCount(); index++) {
+                Uri uri = clip.getItemAt(index).getUri();
+                if (uri != null && !uris.contains(uri)) uris.add(uri);
             }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
         }
-        selectImage(uri);
+        if (uris.isEmpty()) return;
+        for (Uri uri : uris) persistReadPermission(data, uri);
+        selectImages(uris);
     }
 
     private void handleIncomingIntent(Intent intent) {
@@ -181,12 +216,27 @@ public final class MainActivity extends Activity {
                 uri = legacy;
             }
         }
-        if (uri != null) selectImage(uri);
+        if (uri != null) selectImages(List.of(uri));
     }
 
-    private void selectImage(Uri uri) {
+    private void persistReadPermission(Intent data, Uri uri) {
+        if ((data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) == 0) return;
+        try {
+            getContentResolver().takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (SecurityException ignored) {
+            // Some providers grant access only for the current process.
+        }
+    }
+
+    private void selectImages(List<Uri> uris) {
         if (busy) return;
-        selectedUri = uri;
+        selectedImages.clear();
+        for (int index = 0; index < uris.size(); index++) {
+            selectedImages.add(new SelectedImage(
+                uris.get(index), displayName(uris.get(index), "image_" + (index + 1))));
+        }
+        Uri uri = selectedImages.get(0).uri;
         clearCompletedImage();
         setBusy(true);
         currentCancellation = new AtomicBoolean();
@@ -196,15 +246,17 @@ public final class MainActivity extends Activity {
                 ImageStore.Preview preview = imageStore.decodePreview(
                     getContentResolver(), uri, PREVIEW_MAXIMUM);
                 post(() -> {
-                    if (!uri.equals(selectedUri)) {
+                    if (selectedImages.isEmpty()
+                        || !uri.equals(selectedImages.get(0).uri)) {
                         preview.bitmap.recycle();
                         return;
                     }
                     selectedName = preview.displayName;
+                    selectedImages.get(0).name = preview.displayName;
                     showPreview(preview.bitmap);
                     imageDetails.setText(getString(
                         R.string.image_details_format,
-                        selectedName,
+                        selectionLabel(),
                         preview.width,
                         preview.height));
                     emptyPreview.setVisibility(View.GONE);
@@ -219,9 +271,10 @@ public final class MainActivity extends Activity {
     }
 
     private void startDenoising() {
-        Uri sourceUri = selectedUri;
-        if (busy || sourceUri == null) return;
+        if (busy || selectedImages.isEmpty()) return;
+        List<SelectedImage> batch = new ArrayList<>(selectedImages);
         DenoiseProcessor.Mode mode = selectedMode();
+        ModelStore.Quality quality = selectedQuality();
         DenoiseProcessor.OverlapMode overlapMode = highOverlapSwitch.isChecked()
             ? DenoiseProcessor.OverlapMode.HIGH
             : DenoiseProcessor.OverlapMode.FAST;
@@ -234,72 +287,101 @@ public final class MainActivity extends Activity {
 
         tasks.execute(() -> {
             try {
-                File model = modelStore.ensureInstalled(
-                    this,
-                    cancellation,
-                    (copied, total) -> postModelCopyProgress(copied, total));
+                boolean needsGpu = mode == DenoiseProcessor.Mode.GPU
+                    || mode == DenoiseProcessor.Mode.DUAL;
+                boolean needsNpu = mode == DenoiseProcessor.Mode.NPU
+                    || mode == DenoiseProcessor.Mode.DUAL;
+                ModelStore.Variant gpuVariant = quality == ModelStore.Quality.HIGH_PERFORMANCE
+                    ? ModelStore.Variant.HIGH_PERFORMANCE_GPU
+                    : ModelStore.Variant.HIGH_QUALITY;
+                ModelStore.Variant npuVariant = quality == ModelStore.Quality.HIGH_PERFORMANCE
+                    ? ModelStore.Variant.HIGH_PERFORMANCE_NPU
+                    : ModelStore.Variant.HIGH_QUALITY;
+                File gpuModel = needsGpu
+                    ? modelStore.ensureInstalled(
+                        this, gpuVariant, cancellation,
+                        (copied, total) -> postModelCopyProgress(copied, total))
+                    : null;
+                File npuModel = needsNpu
+                    ? modelStore.ensureInstalled(
+                        this, npuVariant, cancellation,
+                        (copied, total) -> postModelCopyProgress(copied, total))
+                    : null;
                 checkCanceled(cancellation);
-                ensureEngines(mode, model, cancellation);
-                checkCanceled(cancellation);
-
-                post(() -> setIndeterminate("Loading full-resolution image"));
-                ImageStore.RgbImage input = imageStore.decodeFull(
-                    getContentResolver(), sourceUri, cancellation);
-                checkCanceled(cancellation);
-                final int width = input.width;
-                final int height = input.height;
-                final int tiles = DenoiseProcessor.tileCount(width, height, overlapMode);
-                post(() -> {
-                    imageDetails.setText(getString(
-                        R.string.image_details_format,
-                        selectedName,
-                        width,
-                        height));
-                    setDeterminate(getResources().getQuantityString(
-                        R.plurals.denoising_tiles, tiles, 0, tiles), 0,
-                        getString(R.string.percent_format, 0));
-                });
-
-                byte[] denoised = processor.process(
-                    input.pixels,
-                    width,
-                    height,
-                    mode,
-                    overlapMode,
-                    gpuEngine,
-                    npuEngine,
-                    cancellation,
-                    (complete, total, elapsed) -> postTileProgress(complete, total, elapsed));
-                input = null;
+                ensureEngines(
+                    mode, quality, gpuVariant, gpuModel, npuVariant, npuModel,
+                    cancellation);
                 checkCanceled(cancellation);
 
-                post(() -> setIndeterminate("Encoding full-resolution JPEG"));
                 File outputDirectory = new File(getCacheDir(), "completed");
-                File output = new File(outputDirectory, "scunet_completed.jpg");
-                imageStore.encodeJpeg(denoised, width, height, output, 96, cancellation);
-                denoised = null;
-                checkCanceled(cancellation);
-                Bitmap preview = imageStore.decodeFilePreview(output, PREVIEW_MAXIMUM);
+                ArrayList<CompletedImage> outputs = new ArrayList<>();
+                Bitmap preview = null;
+                int lastWidth = 0;
+                int lastHeight = 0;
+                for (int batchIndex = 0; batchIndex < batch.size(); batchIndex++) {
+                    checkCanceled(cancellation);
+                    SelectedImage selected = batch.get(batchIndex);
+                    int imageNumber = batchIndex + 1;
+                    post(() -> setIndeterminate(batchStatus(
+                        imageNumber, batch.size(), "Loading full-resolution image")));
+                    ImageStore.RgbImage input = imageStore.decodeFull(
+                        getContentResolver(), selected.uri, cancellation);
+                    int width = input.width;
+                    int height = input.height;
+                    int tiles = DenoiseProcessor.tileCount(width, height, overlapMode);
+                    post(() -> setDeterminate(
+                        batchStatus(imageNumber, batch.size(), "0 / " + tiles + " tiles"),
+                        batchProgress(imageNumber, batch.size(), 0),
+                        imageNumber + " / " + batch.size()));
+                    byte[] denoised = processor.process(
+                        input.pixels, width, height, mode, overlapMode,
+                        gpuEngine, npuEngine, cancellation,
+                        (complete, total, elapsed) -> postBatchTileProgress(
+                            imageNumber, batch.size(), complete, total));
+                    input = null;
+                    checkCanceled(cancellation);
+                    post(() -> setIndeterminate(batchStatus(
+                        imageNumber, batch.size(), "Encoding JPEG")));
+                    File output = new File(outputDirectory, "scunet_completed_" + batchIndex + ".jpg");
+                    imageStore.encodeJpeg(denoised, width, height, output, 96, cancellation);
+                    imageStore.copyExif(
+                        getContentResolver(), selected.uri, output, width, height);
+                    denoised = null;
+                    outputs.add(new CompletedImage(output, selected.name, width, height));
+                    if (preview != null) preview.recycle();
+                    preview = imageStore.decodeFilePreview(output, PREVIEW_MAXIMUM);
+                    lastWidth = width;
+                    lastHeight = height;
+                }
                 long elapsed = SystemClock.elapsedRealtime() - operationStarted;
                 Log.i(TAG, String.format(
                     Locale.US,
-                    "DENOISE_COMPLETE mode=%s width=%d height=%d tiles=%d elapsed_ms=%d bytes=%d",
+                    "DENOISE_COMPLETE mode=%s quality=%s width=%d height=%d images=%d elapsed_ms=%d bytes=%d",
                     mode,
-                    width,
-                    height,
-                    tiles,
+                    quality,
+                    lastWidth,
+                    lastHeight,
+                    outputs.size(),
                     elapsed,
-                    output.length()));
+                    outputs.get(outputs.size() - 1).file.length()));
 
+                Bitmap finalPreview = preview;
+                int finalWidth = lastWidth;
+                int finalHeight = lastHeight;
                 post(() -> {
-                    completedFile = output;
-                    completedWidth = width;
-                    completedHeight = height;
-                    showPreview(preview);
+                    completedImages.clear();
+                    completedImages.addAll(outputs);
+                    CompletedImage last = outputs.get(outputs.size() - 1);
+                    completedFile = last.file;
+                    completedWidth = finalWidth;
+                    completedHeight = finalHeight;
+                    showPreview(finalPreview);
                     emptyPreview.setVisibility(View.GONE);
                     progressBar.setIndeterminate(false);
                     progressBar.setProgress(1000);
-                    progressStatus.setText(R.string.denoising_complete);
+                    progressStatus.setText(outputs.size() == 1
+                        ? getString(R.string.denoising_complete)
+                        : outputs.size() + " images completed");
                     progressPercent.setText(formatDuration(elapsed));
                     sessionStatus.setText(getString(
                         R.string.accelerator_ready, modeLabel(mode)));
@@ -319,9 +401,16 @@ public final class MainActivity extends Activity {
 
     private void ensureEngines(
         DenoiseProcessor.Mode mode,
-        File model,
+        ModelStore.Quality quality,
+        ModelStore.Variant gpuVariant,
+        File gpuModel,
+        ModelStore.Variant npuVariant,
+        File npuModel,
         AtomicBoolean cancellation
     ) throws Exception {
+        if (engineQuality != null && engineQuality != quality) {
+            closeEngines();
+        }
         boolean needsNpu = mode == DenoiseProcessor.Mode.NPU || mode == DenoiseProcessor.Mode.DUAL;
         boolean needsGpu = mode == DenoiseProcessor.Mode.GPU || mode == DenoiseProcessor.Mode.DUAL;
 
@@ -333,7 +422,8 @@ public final class MainActivity extends Activity {
             }
             startNpuTicker();
             long createStarted = SystemClock.elapsedRealtime();
-            AcceleratorEngine created = AcceleratorEngine.createNpu(this, model);
+            AcceleratorEngine created = AcceleratorEngine.createNpu(
+                this, npuModel, modelStore.cacheKey(npuVariant));
             stopNpuTicker();
             try {
                 created.warmUp();
@@ -342,14 +432,16 @@ public final class MainActivity extends Activity {
                 throw error;
             }
             npuEngine = created;
-            Log.i(TAG, "NPU_JIT_READY vendor=" + npuVendor + " elapsed_ms="
+            engineQuality = quality;
+            Log.i(TAG, "NPU_JIT_READY quality=" + quality + " vendor=" + npuVendor + " elapsed_ms="
                 + (SystemClock.elapsedRealtime() - createStarted));
             checkCanceled(cancellation);
         }
         if (needsGpu && gpuEngine == null) {
             post(() -> setIndeterminate("Preparing GPU"));
             long createStarted = SystemClock.elapsedRealtime();
-            AcceleratorEngine created = AcceleratorEngine.createGpu(this, model);
+            AcceleratorEngine created = AcceleratorEngine.createGpu(
+                this, gpuModel, modelStore.cacheKey(gpuVariant));
             try {
                 created.warmUp();
             } catch (Throwable error) {
@@ -357,7 +449,8 @@ public final class MainActivity extends Activity {
                 throw error;
             }
             gpuEngine = created;
-            Log.i(TAG, "GPU_READY elapsed_ms="
+            engineQuality = quality;
+            Log.i(TAG, "GPU_READY quality=" + quality + " elapsed_ms="
                 + (SystemClock.elapsedRealtime() - createStarted));
             checkCanceled(cancellation);
         }
@@ -365,17 +458,20 @@ public final class MainActivity extends Activity {
     }
 
     private void saveCompletedImage() {
-        File source = completedFile;
-        if (busy || source == null || !source.isFile()) return;
+        List<CompletedImage> outputs = new ArrayList<>(completedImages);
+        if (busy || outputs.isEmpty()) return;
         setBusy(true);
         setIndeterminate("Saving image");
-        int width = completedWidth;
-        int height = completedHeight;
-        String outputName = ImageStore.outputName(selectedName);
         tasks.execute(() -> {
             try {
-                imageStore.saveToGallery(
-                    getContentResolver(), source, outputName, width, height);
+                for (int index = 0; index < outputs.size(); index++) {
+                    CompletedImage output = outputs.get(index);
+                    int number = index + 1;
+                    post(() -> setIndeterminate(batchStatus(
+                        number, outputs.size(), "Saving to gallery")));
+                    imageStore.saveToGallery(getContentResolver(), output.file,
+                        ImageStore.outputName(output.name), output.width, output.height);
+                }
                 post(() -> {
                     progressBar.setIndeterminate(false);
                     progressBar.setProgress(1000);
@@ -383,7 +479,10 @@ public final class MainActivity extends Activity {
                     progressPercent.setText(getString(R.string.percent_format, 100));
                     Toast.makeText(
                         this,
-                        getString(R.string.saved_image, outputName),
+                        outputs.size() == 1
+                            ? getString(R.string.saved_image,
+                                ImageStore.outputName(outputs.get(0).name))
+                            : "Saved " + outputs.size() + " images",
                         Toast.LENGTH_LONG).show();
                 });
             } catch (Throwable error) {
@@ -459,12 +558,16 @@ public final class MainActivity extends Activity {
     private void setBusy(boolean value) {
         busy = value;
         chooseButton.setEnabled(!value);
-        runButton.setEnabled(!value && selectedUri != null);
-        saveButton.setEnabled(!value && completedFile != null && completedFile.isFile());
+        runButton.setEnabled(!value && !selectedImages.isEmpty());
+        saveButton.setEnabled(!value && !completedImages.isEmpty());
         backendGroup.setEnabled(!value);
+        qualityGroup.setEnabled(!value);
         highOverlapSwitch.setEnabled(!value);
         for (int index = 0; index < backendGroup.getChildCount(); index++) {
             backendGroup.getChildAt(index).setEnabled(!value);
+        }
+        for (int index = 0; index < qualityGroup.getChildCount(); index++) {
+            qualityGroup.getChildAt(index).setEnabled(!value);
         }
         boolean npuAvailable = npuVendor != NpuSupport.Vendor.UNSUPPORTED;
         npuButton.setEnabled(!value && npuAvailable);
@@ -497,7 +600,8 @@ public final class MainActivity extends Activity {
     }
 
     private void applyNpuAvailability() {
-        boolean available = npuVendor != NpuSupport.Vendor.UNSUPPORTED;
+        boolean hardwareAvailable = npuVendor != NpuSupport.Vendor.UNSUPPORTED;
+        boolean available = hardwareAvailable;
         npuButton.setEnabled(available);
         dualButton.setEnabled(available && !highOverlapSwitch.isChecked());
         if (available) {
@@ -521,6 +625,12 @@ public final class MainActivity extends Activity {
         return DenoiseProcessor.Mode.GPU;
     }
 
+    private ModelStore.Quality selectedQuality() {
+        return qualityGroup.getCheckedRadioButtonId() == R.id.quality_fast
+            ? ModelStore.Quality.HIGH_PERFORMANCE
+            : ModelStore.Quality.HIGH_QUALITY;
+    }
+
     private static String modeLabel(DenoiseProcessor.Mode mode) {
         if (mode == DenoiseProcessor.Mode.NPU) return "NPU";
         if (mode == DenoiseProcessor.Mode.DUAL) return "GPU + NPU";
@@ -535,10 +645,70 @@ public final class MainActivity extends Activity {
     }
 
     private void clearCompletedImage() {
+        completedImages.clear();
         completedFile = null;
         completedWidth = 0;
         completedHeight = 0;
         saveButton.setEnabled(false);
+    }
+
+    private String selectionLabel() {
+        if (selectedImages.size() <= 1) return selectedName;
+        return selectedName + " + " + (selectedImages.size() - 1) + " more";
+    }
+
+    private String displayName(Uri uri, String fallback) {
+        try (Cursor cursor = getContentResolver().query(
+            uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                String value = cursor.getString(0);
+                if (value != null && !value.isBlank()) return value;
+            }
+        } catch (RuntimeException ignored) {
+            // A provider may omit metadata while still allowing the image stream.
+        }
+        return fallback;
+    }
+
+    private static String batchStatus(int current, int total, String detail) {
+        return total <= 1 ? detail : "Image " + current + " of " + total + " · " + detail;
+    }
+
+    private static int batchProgress(int current, int total, int imageProgress) {
+        return (int) Math.min(1000,
+            ((current - 1L) * 1000L + imageProgress) / Math.max(1, total));
+    }
+
+    private void postBatchTileProgress(int image, int imageTotal, int complete, int total) {
+        int imageProgress = (int) Math.min(1000, complete * 1000L / total);
+        post(() -> setDeterminate(
+            batchStatus(image, imageTotal, complete + " / " + total + " tiles"),
+            batchProgress(image, imageTotal, imageProgress),
+            image + " / " + imageTotal));
+    }
+
+    private static final class SelectedImage {
+        final Uri uri;
+        String name;
+
+        SelectedImage(Uri uri, String name) {
+            this.uri = uri;
+            this.name = name;
+        }
+    }
+
+    private static final class CompletedImage {
+        final File file;
+        final String name;
+        final int width;
+        final int height;
+
+        CompletedImage(File file, String name, int width, int height) {
+            this.file = file;
+            this.name = name;
+            this.width = width;
+            this.height = height;
+        }
     }
 
     private void postError(String message, Throwable error) {
@@ -617,5 +787,6 @@ public final class MainActivity extends Activity {
             npuEngine.close();
             npuEngine = null;
         }
+        engineQuality = null;
     }
 }

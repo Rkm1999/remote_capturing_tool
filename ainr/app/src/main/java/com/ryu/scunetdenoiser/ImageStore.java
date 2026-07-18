@@ -10,6 +10,8 @@ import android.os.Environment;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 
+import androidx.exifinterface.media.ExifInterface;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
@@ -23,6 +25,46 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class ImageStore {
+    private static final String[] COPIED_EXIF_TAGS = {
+        ExifInterface.TAG_APERTURE_VALUE,
+        ExifInterface.TAG_ARTIST,
+        ExifInterface.TAG_BRIGHTNESS_VALUE,
+        ExifInterface.TAG_COPYRIGHT,
+        ExifInterface.TAG_DATETIME,
+        ExifInterface.TAG_DATETIME_DIGITIZED,
+        ExifInterface.TAG_DATETIME_ORIGINAL,
+        ExifInterface.TAG_EXPOSURE_BIAS_VALUE,
+        ExifInterface.TAG_EXPOSURE_MODE,
+        ExifInterface.TAG_EXPOSURE_PROGRAM,
+        ExifInterface.TAG_EXPOSURE_TIME,
+        ExifInterface.TAG_FLASH,
+        ExifInterface.TAG_F_NUMBER,
+        ExifInterface.TAG_FOCAL_LENGTH,
+        ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM,
+        ExifInterface.TAG_GPS_ALTITUDE,
+        ExifInterface.TAG_GPS_ALTITUDE_REF,
+        ExifInterface.TAG_GPS_DATESTAMP,
+        ExifInterface.TAG_GPS_LATITUDE,
+        ExifInterface.TAG_GPS_LATITUDE_REF,
+        ExifInterface.TAG_GPS_LONGITUDE,
+        ExifInterface.TAG_GPS_LONGITUDE_REF,
+        ExifInterface.TAG_GPS_PROCESSING_METHOD,
+        ExifInterface.TAG_GPS_TIMESTAMP,
+        ExifInterface.TAG_ISO_SPEED_RATINGS,
+        ExifInterface.TAG_LENS_MAKE,
+        ExifInterface.TAG_LENS_MODEL,
+        ExifInterface.TAG_MAKE,
+        ExifInterface.TAG_METERING_MODE,
+        ExifInterface.TAG_MODEL,
+        ExifInterface.TAG_SCENE_CAPTURE_TYPE,
+        ExifInterface.TAG_SOFTWARE,
+        ExifInterface.TAG_SUBSEC_TIME,
+        ExifInterface.TAG_SUBSEC_TIME_DIGITIZED,
+        ExifInterface.TAG_SUBSEC_TIME_ORIGINAL,
+        ExifInterface.TAG_USER_COMMENT,
+        ExifInterface.TAG_WHITE_BALANCE
+    };
+
     static final class Preview {
         final Bitmap bitmap;
         final int width;
@@ -147,6 +189,41 @@ final class ImageStore {
             }
         } finally {
             bitmap.recycle();
+        }
+    }
+
+    void copyExif(
+        ContentResolver resolver,
+        Uri source,
+        File destination,
+        int outputWidth,
+        int outputHeight
+    ) throws IOException {
+        try (InputStream input = new BufferedInputStream(resolver.openInputStream(source))) {
+            if (input == null) throw new IOException("Could not reopen source metadata");
+            ExifInterface sourceExif = new ExifInterface(input);
+            ExifInterface destinationExif = new ExifInterface(destination.getAbsolutePath());
+            for (String tag : COPIED_EXIF_TAGS) {
+                String value = sourceExif.getAttribute(tag);
+                if (value != null) destinationExif.setAttribute(tag, value);
+            }
+            // ImageDecoder applies source rotation before inference and JPEG encoding.
+            destinationExif.setAttribute(
+                ExifInterface.TAG_ORIENTATION,
+                Integer.toString(ExifInterface.ORIENTATION_NORMAL));
+            destinationExif.setAttribute(
+                ExifInterface.TAG_PIXEL_X_DIMENSION,
+                Integer.toString(outputWidth));
+            destinationExif.setAttribute(
+                ExifInterface.TAG_PIXEL_Y_DIMENSION,
+                Integer.toString(outputHeight));
+            destinationExif.setAttribute(
+                ExifInterface.TAG_IMAGE_WIDTH,
+                Integer.toString(outputWidth));
+            destinationExif.setAttribute(
+                ExifInterface.TAG_IMAGE_LENGTH,
+                Integer.toString(outputHeight));
+            destinationExif.saveAttributes();
         }
     }
 

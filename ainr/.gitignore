@@ -7,3 +7,11 @@ dist/
 ios/.build/
 ios/xtool/
 ios/*.ipa
+# Local distillation datasets, teacher targets, checkpoints, and run outputs.
+training/distillation/data/
+training/distillation/runs/
+training/distillation/__pycache__/
+training/distillation/export/
+# Generated visual evaluations; the small curated verification set is tracked separately.
+verification/distilled-*/
+verification/litedenoise-*/

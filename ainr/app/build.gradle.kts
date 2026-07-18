@@ -10,8 +10,8 @@ android {
         applicationId = "com.ryu.scunetdenoiser"
         minSdk = 29
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.1.0-beta.1"
+        versionCode = 5
+        versionName = "0.1.0-beta.3"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -40,6 +40,7 @@ android {
 }
 
 dependencies {
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("com.google.ai.edge.litert:litert:2.1.6")
     testImplementation("junit:junit:4.13.2")
 }

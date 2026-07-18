@@ -1,8 +1,8 @@
 <resources>
     <string name="app_name">SCUNet Denoiser</string>
-    <string name="choose_image">Choose image</string>
+    <string name="choose_image">Choose images</string>
     <string name="run_denoise">Run denoise</string>
-    <string name="save_image">Save image</string>
+    <string name="save_image">Save results</string>
     <string name="cancel">Cancel</string>
     <string name="gpu">GPU</string>
     <string name="npu">NPU</string>
@@ -15,9 +15,12 @@
     <string name="select_an_image">Select an image</string>
     <string name="no_image_selected">No image selected</string>
     <string name="accelerator">Accelerator</string>
+    <string name="model_quality">Model quality</string>
+    <string name="high_performance_8bit">Performance · Distilled</string>
+    <string name="high_quality_16bit">Quality · SCUNet 16-bit</string>
     <string name="high_overlap">High overlap</string>
     <string name="high_overlap_summary">Suppress tile patterns · slower</string>
-    <string name="compiling_npu">Compiling NPU on device</string>
+    <string name="compiling_npu">Preparing NPU</string>
     <string name="denoising_complete">Denoising complete</string>
     <string name="accelerator_ready">%1$s ready</string>
     <string name="saved_location">Saved to Pictures / SCUNet Denoiser</string>

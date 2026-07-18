@@ -1,0 +1,24 @@
+seed: 1337
+tile_size: 192
+
+data:
+  extended_cache_root: data/extended_cache
+
+student:
+  base_width: 24
+  encoder_blocks: [2, 3]
+  body_blocks: 6
+  expansion: 2
+
+training:
+  epochs: 20
+  batch_size: 8
+  gradient_accumulation: 2
+  learning_rate: 0.0002
+  minimum_learning_rate: 0.00001
+  weight_decay: 0.000001
+  num_workers: 4
+  amp: true
+  teacher_weight: 0.8
+  clean_weight: 0.2
+  edge_weight: 0.1

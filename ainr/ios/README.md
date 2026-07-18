@@ -4,22 +4,31 @@ Native SwiftUI port of the standalone full-resolution SCUNet denoiser.
 
 ## Features
 
-- Import JPEG, HEIC, PNG, and other iOS-supported images from Photos, Files,
-  Open In, or the share sheet
+- Import one or more JPEG, HEIC, PNG, and other iOS-supported images from
+  Photos, Files, Open In, or the share sheet
+- Process batch selections sequentially with one warm Core ML session, show
+  image and tile progress, and save or share all completed results together
 - Load a bundled 24 MP Sony ISO 51200 JPEG for repeatable device testing
 - Normalize source orientation before processing
 - Process the full image with overlapping 192 x 192 tiles and an 8-pixel
   feathered context on every edge
 - Select GPU, Neural Engine, GPU + Neural Engine, or CPU execution explicitly
+- Select **High Performance** for the FP16 LiteDenoise student or **High
+  Quality** for the original FP16 SCUNet. High Quality remains the default.
 - Show model preparation, tile progress, elapsed time, and the selected backend
 - Optionally use 50% whole-tile weighted overlap to suppress checkerboard patterns
 - Cancel between tiles, compare original and result, then save or share the JPEG
 
-The app uses one native Core ML ML Program with FP16 weights and FP32 input and
-output tensors. Core ML compiles it on the iPhone once and the app retains the
-compiled model in Application Support for later launches. Neural Engine is the
-default because the optimized fixed-shape graph is the fastest sustained path
-on the tested iPhone. A previously selected backend is still remembered.
+The app uses native Core ML ML Programs with FP16 weights and FP32 input and
+output tensors. High Performance uses the compact epoch-177 LiteDenoise graph;
+High Quality uses full SCUNet. Core
+ML compiles each model on the iPhone once and the app retains separate compiled
+models in Application Support for later launches. Neural Engine is the default
+because the optimized fixed-shape graph is the fastest sustained path on the
+tested iPhone. Previously selected backend and quality settings are remembered.
+
+The checked-in LiteDenoise package is reproducible with
+[`../training/distillation/export_litedenoise_ios.py`](../training/distillation/export_litedenoise_ios.py).
 
 The compute-unit choices constrain Core ML as follows:
 

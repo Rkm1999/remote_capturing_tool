@@ -32,6 +32,9 @@ final class DenoiseViewModel: ObservableObject {
     @Published var backend: DenoiseBackend {
         didSet { UserDefaults.standard.set(backend.rawValue, forKey: Self.backendKey) }
     }
+    @Published var quality: DenoiseQuality {
+        didSet { UserDefaults.standard.set(quality.rawValue, forKey: Self.qualityKey) }
+    }
     @Published var highOverlap: Bool {
         didSet { UserDefaults.standard.set(highOverlap, forKey: Self.highOverlapKey) }
     }
@@ -42,13 +45,17 @@ final class DenoiseViewModel: ObservableObject {
     @Published var isProcessing = false
     @Published var isSaving = false
     @Published var result: DenoiseResult?
+    @Published var results: [DenoiseResult] = []
+    @Published var batchIndex = 0
+    @Published var batchCount = 0
     @Published var alertMessage: String?
     @Published var processingStartedAt: Date?
 
     private static let backendKey = "SCUNetBackend"
     private static let highOverlapKey = "SCUNetHighOverlap"
+    private static let qualityKey = "SCUNetQuality"
     private let processor = SCUNetProcessor.shared
-    private var sourceURL: URL?
+    private var sources: [ImportedSelection] = []
     private var importTask: Task<Void, Never>?
     private var processingTask: Task<Void, Never>?
     private var runID: UUID?
@@ -57,6 +64,9 @@ final class DenoiseViewModel: ObservableObject {
     init() {
         highOverlap = UserDefaults.standard.bool(forKey: Self.highOverlapKey)
         let saved = UserDefaults.standard.string(forKey: Self.backendKey)
+        quality = DenoiseQuality(
+            rawValue: UserDefaults.standard.string(forKey: Self.qualityKey) ?? ""
+        ) ?? .highQuality
         if let requested = CommandLine.arguments.first(where: {
             $0.hasPrefix("--scunet-backend=")
         })?.split(separator: "=", maxSplits: 1).last,
@@ -78,7 +88,12 @@ final class DenoiseViewModel: ObservableObject {
     }
 
     var canRun: Bool {
-        sourceURL != nil && !isLoadingImage && !isProcessing
+        !sources.isEmpty && !isLoadingImage && !isProcessing
+    }
+
+    var overallProgress: Double? {
+        guard batchCount > 0, batchIndex > 0 else { return progress?.fraction }
+        return (Double(batchIndex - 1) + (progress?.fraction ?? 0)) / Double(batchCount)
     }
 
     var imageDetails: String {
@@ -88,19 +103,33 @@ final class DenoiseViewModel: ObservableObject {
     }
 
     func importURL(_ url: URL) {
+        importURLs([url])
+    }
+
+    func importURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
         beginImport {
+            try urls.map { url in
             let imported = try ImageCodec.importSource(url)
             return try Self.selection(url: imported.0, name: imported.1)
+            }
         }
     }
 
     func importPhotoData(_ data: Data, preferredExtension: String) {
+        importPhotoData([(data, preferredExtension)])
+    }
+
+    func importPhotoData(_ items: [(Data, String)]) {
+        guard !items.isEmpty else { return }
         beginImport {
-            let imported = try ImageCodec.importSource(
-                data: data,
-                preferredExtension: preferredExtension
-            )
-            return try Self.selection(url: imported.0, name: imported.1)
+            try items.map { data, fileExtension in
+                let imported = try ImageCodec.importSource(
+                    data: data,
+                    preferredExtension: fileExtension
+                )
+                return try Self.selection(url: imported.0, name: imported.1)
+            }
         }
     }
 
@@ -119,54 +148,72 @@ final class DenoiseViewModel: ObservableObject {
         }
         runAfterImport = runWhenReady
         beginImport {
-            try Self.selection(url: url, name: "Checkerboard test - ISO 25600.JPG")
+            [try Self.selection(url: url, name: "Checkerboard test - ISO 25600.JPG")]
         }
     }
 
     func runDenoise() {
-        guard let sourceURL, canRun else { return }
+        guard canRun else { return }
+        let selectedSources = sources
         processingTask?.cancel()
         let currentRun = UUID()
         runID = currentRun
         isProcessing = true
         processingStartedAt = Date()
         result = nil
+        results = []
+        batchIndex = 1
+        batchCount = selectedSources.count
         resultPreview = nil
         previewMode = .original
         status = "Preparing \(backend.rawValue). First run can take longer."
         let selectedBackend = backend
+        let selectedQuality = quality
         let selectedHighOverlap = highOverlap
-        let selectedName = sourceName
 
         processingTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let completed = try await processor.process(
-                    sourceURL: sourceURL,
-                    sourceName: selectedName,
-                    backend: selectedBackend,
-                    highOverlap: selectedHighOverlap
-                ) { [weak self] update in
-                    Task { @MainActor in
-                        guard let self, self.runID == currentRun else { return }
-                        self.apply(update)
+                var completedBatch: [DenoiseResult] = []
+                for (index, source) in selectedSources.enumerated() {
+                    try Task.checkCancellation()
+                    batchIndex = index + 1
+                    status = Self.batchStatus(index + 1, selectedSources.count, "Preparing")
+                    let completed = try await processor.process(
+                        sourceURL: source.url,
+                        sourceName: source.name,
+                        backend: selectedBackend,
+                        quality: selectedQuality,
+                        highOverlap: selectedHighOverlap
+                    ) { [weak self] update in
+                        Task { @MainActor in
+                            guard let self, self.runID == currentRun else { return }
+                            self.apply(update)
+                        }
                     }
+                    completedBatch.append(completed)
                 }
                 try Task.checkCancellation()
+                guard let completed = completedBatch.last else { return }
                 let preview = try ImageCodec.previewImage(completed.url)
                 guard runID == currentRun else { return }
                 result = completed
+                results = completedBatch
                 resultPreview = preview
                 previewMode = .result
                 progress = nil
                 isProcessing = false
                 processingStartedAt = nil
-                status = "Completed in \(Self.duration(completed.elapsedSeconds)) using \(completed.backendLabel)"
+                status = completedBatch.count == 1
+                    ? "Completed in \(Self.duration(completed.elapsedSeconds)) · \(completed.quality.rawValue)"
+                    : "Completed \(completedBatch.count) images · \(completed.quality.rawValue)"
             } catch is CancellationError {
                 guard runID == currentRun else { return }
                 progress = nil
                 isProcessing = false
                 processingStartedAt = nil
+                batchIndex = 0
+                batchCount = 0
                 status = "Canceled"
             } catch {
                 guard runID == currentRun else { return }
@@ -174,6 +221,8 @@ final class DenoiseViewModel: ObservableObject {
                 progress = nil
                 isProcessing = false
                 processingStartedAt = nil
+                batchIndex = 0
+                batchCount = 0
                 status = "Denoising failed"
                 alertMessage = error.localizedDescription
             }
@@ -186,7 +235,8 @@ final class DenoiseViewModel: ObservableObject {
     }
 
     func saveResultToPhotos() {
-        guard let result, !isSaving else { return }
+        let completed = results
+        guard !completed.isEmpty, !isSaving else { return }
         isSaving = true
         status = "Saving to Photos"
         Task { [weak self] in
@@ -197,12 +247,16 @@ final class DenoiseViewModel: ObservableObject {
                     throw SCUNetError(message: "Photo library access was not granted")
                 }
                 try await PHPhotoLibrary.shared().performChanges {
-                    PHAssetChangeRequest.creationRequestForAssetFromImage(
-                        atFileURL: result.url
-                    )
+                    for result in completed {
+                        PHAssetChangeRequest.creationRequestForAssetFromImage(
+                            atFileURL: result.url
+                        )
+                    }
                 }
                 isSaving = false
-                status = "Saved to Photos"
+                status = completed.count == 1
+                    ? "Saved to Photos"
+                    : "Saved \(completed.count) images to Photos"
             } catch {
                 isSaving = false
                 status = "Save failed"
@@ -216,7 +270,7 @@ final class DenoiseViewModel: ObservableObject {
     }
 
     private func beginImport(
-        operation: @escaping @Sendable () throws -> ImportedSelection
+        operation: @escaping @Sendable () throws -> [ImportedSelection]
     ) {
         importTask?.cancel()
         processingTask?.cancel()
@@ -224,6 +278,8 @@ final class DenoiseViewModel: ObservableObject {
         isLoadingImage = true
         isProcessing = false
         processingStartedAt = nil
+        batchIndex = 0
+        batchCount = 0
         progress = nil
         status = "Loading photo"
         importTask = Task { [weak self] in
@@ -234,12 +290,18 @@ final class DenoiseViewModel: ObservableObject {
                     operation: operation
                 ).value
                 try Task.checkCancellation()
-                sourceURL = imported.url
-                sourceName = imported.name
-                sourceWidth = imported.width
-                sourceHeight = imported.height
-                sourcePreview = imported.preview
+                guard let first = imported.first else {
+                    throw SCUNetError(message: "No images were selected")
+                }
+                sources = imported
+                sourceName = imported.count == 1
+                    ? first.name
+                    : "\(first.name) + \(imported.count - 1) more"
+                sourceWidth = first.width
+                sourceHeight = first.height
+                sourcePreview = first.preview
                 result = nil
+                results = []
                 resultPreview = nil
                 previewMode = .original
                 isLoadingImage = false
@@ -264,13 +326,16 @@ final class DenoiseViewModel: ObservableObject {
         progress = update
         switch update.phase {
         case .loading:
-            status = update.phase.rawValue
+            status = Self.batchStatus(batchIndex, batchCount, update.phase.rawValue)
         case .preparing:
-            status = "Preparing \(backend.rawValue). First run can take longer."
+            status = Self.batchStatus(batchIndex, batchCount, "Preparing \(backend.rawValue)")
         case .processing:
-            status = "Tile \(update.completedTiles) of \(update.totalTiles)"
+            status = Self.batchStatus(
+                batchIndex, batchCount,
+                "Tile \(update.completedTiles) of \(update.totalTiles)"
+            )
         case .encoding:
-            status = update.phase.rawValue
+            status = Self.batchStatus(batchIndex, batchCount, update.phase.rawValue)
         }
     }
 
@@ -292,5 +357,9 @@ final class DenoiseViewModel: ObservableObject {
         if seconds < 60 { return String(format: "%.1f sec", seconds) }
         let minutes = Int(seconds) / 60
         return "\(minutes)m \(Int(seconds) % 60)s"
+    }
+
+    private static func batchStatus(_ current: Int, _ total: Int, _ detail: String) -> String {
+        total <= 1 ? detail : "Image \(current) of \(total) · \(detail)"
     }
 }

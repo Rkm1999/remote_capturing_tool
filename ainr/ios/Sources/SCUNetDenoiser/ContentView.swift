@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: DenoiseViewModel
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     @State private var showFileImporter = false
 
     var body: some View {
@@ -20,28 +20,32 @@ struct ContentView: View {
             .fileImporter(
                 isPresented: $showFileImporter,
                 allowedContentTypes: [.image],
-                allowsMultipleSelection: false
+                allowsMultipleSelection: true
             ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    viewModel.importURL(url)
+                if case .success(let urls) = result, !urls.isEmpty {
+                    viewModel.importURLs(urls)
                 } else if case .failure(let error) = result {
                     viewModel.report(error)
                 }
             }
-            .onChange(of: photoItem) { _, item in
-                guard let item else { return }
+            .onChange(of: photoItems) { _, items in
+                guard !items.isEmpty else { return }
                 Task {
                     do {
-                        guard let data = try await item.loadTransferable(type: Data.self) else {
-                            throw SCUNetError(message: "The selected photo could not be loaded")
+                        var imported: [(Data, String)] = []
+                        for item in items {
+                            guard let data = try await item.loadTransferable(type: Data.self) else {
+                                throw SCUNetError(message: "A selected photo could not be loaded")
+                            }
+                            let fileExtension = item.supportedContentTypes.first?
+                                .preferredFilenameExtension ?? "jpg"
+                            imported.append((data, fileExtension))
                         }
-                        let fileExtension = item.supportedContentTypes.first?
-                            .preferredFilenameExtension ?? "jpg"
-                        viewModel.importPhotoData(data, preferredExtension: fileExtension)
+                        viewModel.importPhotoData(imported)
                     } catch {
                         viewModel.report(error)
                     }
-                    photoItem = nil
+                    photoItems = []
                 }
             }
             .alert(
@@ -75,8 +79,12 @@ struct ContentView: View {
                         .font(.system(size: 42, weight: .light))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 10) {
-                        PhotosPicker(selection: $photoItem, matching: .images) {
-                            Label("Choose Photo", systemImage: "photo")
+                        PhotosPicker(
+                            selection: $photoItems,
+                            maxSelectionCount: 100,
+                            matching: .images
+                        ) {
+                            Label("Choose Photos", systemImage: "photo")
                         }
                         .buttonStyle(.borderedProminent)
                         Button(action: viewModel.loadTestImage) {
@@ -137,6 +145,14 @@ struct ContentView: View {
                 }
             }
 
+            Picker("Model quality", selection: $viewModel.quality) {
+                ForEach(DenoiseQuality.allCases) { quality in
+                    Text(quality.pickerLabel).tag(quality)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(viewModel.isProcessing)
+
             Toggle("High overlap", isOn: $viewModel.highOverlap)
                 .font(.subheadline)
                 .disabled(viewModel.isProcessing)
@@ -148,7 +164,7 @@ struct ContentView: View {
 
             if viewModel.isProcessing {
                 VStack(spacing: 5) {
-                    if let fraction = viewModel.progress?.fraction {
+                    if let fraction = viewModel.overallProgress {
                         ProgressView(value: fraction)
                     } else {
                         ProgressView()
@@ -181,7 +197,7 @@ struct ContentView: View {
                     .disabled(!viewModel.canRun)
                 }
 
-                if let result = viewModel.result {
+                if viewModel.result != nil {
                     Button(action: viewModel.saveResultToPhotos) {
                         Image(systemName: viewModel.isSaving ? "hourglass" : "square.and.arrow.down")
                             .frame(width: 30)
@@ -190,7 +206,7 @@ struct ContentView: View {
                     .disabled(viewModel.isSaving)
                     .accessibilityLabel("Save to Photos")
 
-                    ShareLink(item: result.url) {
+                    ShareLink(items: viewModel.results.map(\.url)) {
                         Image(systemName: "square.and.arrow.up")
                             .frame(width: 30)
                     }
@@ -208,10 +224,14 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var importToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
-            PhotosPicker(selection: $photoItem, matching: .images) {
+            PhotosPicker(
+                selection: $photoItems,
+                maxSelectionCount: 100,
+                matching: .images
+            ) {
                 Image(systemName: "photo.badge.plus")
             }
-            .accessibilityLabel("Choose from Photos")
+            .accessibilityLabel("Choose photos")
             Button { showFileImporter = true } label: {
                 Image(systemName: "folder")
             }
